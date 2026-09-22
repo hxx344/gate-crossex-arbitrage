@@ -81,3 +81,16 @@ npm start
 ## 官方接口依据
 
 2026-09-22 核对：[Gate CrossEx](https://www.gate.com/docs/developers/crossex/zh_CN/) 的 `GET /api/v4/crossex/rule/symbols` 无需认证；模块同时使用 [Binance USDⓈ-M 深度](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Order-Book) 和 [Bybit 线性深度](https://bybit-exchange.github.io/docs/v5/market/orderbook)。其余规则及公开接口见 [OKX](https://www.okx.com/docs-v5/en/)、[Kraken Futures](https://docs.kraken.com/api/docs/futures-api/websocket/book/)、[Hyperliquid 合约说明](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications)、[Lighter](https://apidocs.lighter.xyz/docs/websocket-reference)。行情请求包含只读 GET、Hyperliquid info POST，以及 Kraken / Lighter 单次公开 WebSocket 快照；服务中没有私有交易所 API 写请求。
+
+
+## 工作台摘要与页面读取
+
+`GET /api/hub/summary?schemaVersion=2` 只读当前持仓、聚合盈亏和行情状态，不创建完整机会、历史或事件列表。`health` 区分 offline、partial、stale 和 online，并具体说明盘口或目录问题；10 秒有效期依据原盘口时间，使用最旧有效源时间，新的单条报价不能掩盖其他过期盘口。无参数继续提供 v1 摘要。
+
+页面仍每 5 秒检查一次状态，但历史和事件只在“记录与收益”打开时读取；随后按 `historyVersion` 省略未变化的历史，服务重启自动重建版本。默认 `/api/state` 保留完整返回，`history=0` 为紧凑读取。手动刷新与轮询共享请求，12 秒超时；保存或模拟后的刷新取消旧读取并忽略乱序响应。隐藏、离开模块和工作台握手前停止前端读取，恢复立即刷新；后台模拟持续按既有设置运行。
+
+工作台握手成功后提供“在 Monitor 查看”。Monitor 的“在 CrossEx 查看”通过 `symbol/longExchange/shortExchange` 定位同一方向，独立打开也可从 URL 恢复筛选；所有跳转只调整页面，不开仓、不改设置。桥严格核对父窗口、独立代理主机名、协议和端口。成功保存设置或模拟操作后通知工作台刷新摘要。
+
+Monitor 的 gzip 响应由 HTTP 客户端自动解压一次，大小限制针对解压后内容。公开构建产物 `/assets/<name>-<hash>.js/css` 明确返回一年 immutable 缓存；HTML 和 API 保持 no-store。工作台仅缓存经过该标记的构建资源。
+
+升级仍使用上方一键命令；无需新增配置或依赖，原有依赖、构建与验证输入摘要包含本次修改，配置和模拟记录保留。

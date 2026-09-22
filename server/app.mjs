@@ -54,24 +54,18 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'");
     try {
-      const route = new URL(req.url, 'http://localhost').pathname;
+      const url = new URL(req.url, 'http://localhost'), route = url.pathname;
       if (route === '/api/health' && req.method === 'GET') return json(res, 200, { status: 'ok', mode: 'paper', liveTradingAvailable: false });
       if (!await authenticate(req)) { res.setHeader('WWW-Authenticate', 'Basic realm="Gate CrossEx paper", charset="UTF-8"'); return json(res, 401, { error: '需要模块登录信息' }); }
       if (!['GET', 'HEAD'].includes(req.method)) {
         const expected = publicOrigin || `http://${req.headers.host}`;
         if (req.headers.origin !== expected || req.headers['sec-fetch-site'] === 'cross-site' || !equal(req.headers['x-csrf-token'] || '', csrf)) throw new AppError('操作来源或会话校验失败，请刷新页面', 403);
       }
-      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...engine.view(), csrfToken: csrf });
+      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...engine.view({ includeHistory: url.searchParams.get('history') !== '0', historyVersion: url.searchParams.get('historyVersion') }), csrfToken: csrf });
       if (route === '/api/hub/summary' && req.method === 'GET') {
-        const value = engine.view();
-        return json(res, 200, { schemaVersion: 1, data: { updatedAt: new Date(value.source.updatedAt || 0).toISOString(), metrics: [
-          { key: 'mode', label: '执行模式', value: value.config.enabled ? '自动模拟' : '模拟已暂停', detail: '仅本地模拟，不发送交易所订单' },
-          { key: 'source', label: '价差信号', value: value.source.state, detail: value.source.error || '七所同币种永续，按实际汇率折算 USDT' },
-          { key: 'positions', label: '模拟持仓', value: value.totals.openCount, unit: '组' },
-          { key: 'realized', label: '模拟已实现盈亏', value: value.totals.realizedPnl, unit: 'USDT', detail: '扣除配置手续费，未含资金费；不计入资产账本' },
-          { key: 'unrealized', label: '模拟浮动盈亏', value: value.totals.unrealizedPnl, unit: 'USDT', detail: '按平仓方向盘口估值；过期时不汇总' },
-          { key: 'catalog', label: 'CrossEx 目录', value: value.catalog.state },
-        ] } });
+        if (url.searchParams.get('schemaVersion') === '2') return json(res, 200, { schemaVersion: 2, data: engine.summary() });
+        const value = engine.summary();
+        return json(res, 200, { schemaVersion: 1, data: { updatedAt: value.updatedAt || new Date(0).toISOString(), metrics: value.metrics } });
       }
       if (route === '/api/settings' && req.method === 'PUT') return json(res, 200, await engine.settings(await body(req)));
       if (route === '/api/open' && req.method === 'POST') { const input = await body(req); return json(res, 200, await engine.open(input.signalId, input.requestId)); }
@@ -82,6 +76,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
       if (!/^(?:index\.html|favicon\.svg|assets\/[A-Za-z0-9_.-]+)$/.test(asset)) throw new AppError('页面不存在', 404);
       let content; try { content = await readFile(path.join(distDir, asset)); } catch { throw new AppError('页面尚未构建或文件不存在', 404); }
       const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
+      if (/^assets\/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:js|css)$/.test(asset)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       res.writeHead(200, { 'Content-Type': types[path.extname(asset)] || 'application/octet-stream' }); res.end(req.method === 'HEAD' ? undefined : content);
     } catch (error) { if (!res.headersSent) json(res, error instanceof AppError ? error.status : 500, { error: error instanceof AppError ? error.message : '操作未完成，请检查服务状态' }); else res.end(); }
   });

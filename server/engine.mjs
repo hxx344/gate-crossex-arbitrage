@@ -7,6 +7,21 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
   let feed = null, sourceError = '等待首次读取价差服务', sourceCheckedAt = null, catalogError = null;
   let catalog = store.get('catalog', { at: 0, items: [] }), catalogAttempt = 0, chain = Promise.resolve(), closing = false;
   const recentSignals = new Map();
+  let indexedFeed = null, quoteIndex = new Map(), venueCounts = new Map(), cachedHistory = null;
+  const historyEpoch = randomUUID();
+  function indexFeed() {
+    if (indexedFeed === feed) return;
+    indexedFeed = feed; quoteIndex = new Map(); venueCounts = new Map();
+    for (const q of feed?.quotes || []) { quoteIndex.set(quoteKey(q), q); venueCounts.set(q.exchange, (venueCounts.get(q.exchange) || 0) + 1); }
+  }
+  function historyView(knownVersion) {
+    const eventId = store.db.prepare('SELECT coalesce(max(id),0) AS id FROM events').get().id;
+    const closed = store.db.prepare("SELECT count(*) AS count,max(json_extract(json,'$.closedAt')) AS at FROM positions WHERE status='closed'").get();
+    const version = [historyEpoch, eventId, closed.count, closed.at || 0].join(':');
+    if (version === knownVersion) return { historyVersion: version };
+    if (cachedHistory?.historyVersion !== version) cachedHistory = { historyVersion: version, history: store.positions('closed', 200), events: store.db.prepare('SELECT at,message FROM events ORDER BY id DESC LIMIT 100').all() };
+    return cachedHistory;
+  }
   // All actions and scheduler ticks share one queue; limits and dedup are checked inside it.
   const serial = action => { const result = chain.then(() => { if (closing) throw new AppError('服务正在关闭', 503); return action(); }); chain = result.catch(() => {}); return result; };
   const config = () => store.config();
@@ -46,8 +61,8 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
   }
   function valuation(p) {
     if (p.status === 'closed') return { at: p.closedAt, stale: false, ...p.result };
-    const quotes = new Map((feed?.quotes || []).map(q => [quoteKey(q), q]));
-    const long = quotes.get(quoteKey(p.long)), short = quotes.get(quoteKey(p.short));
+    indexFeed();
+    const long = quoteIndex.get(quoteKey(p.long)), short = quoteIndex.get(quoteKey(p.short));
     const old = () => ({ ...(p.lastValuation || { at: null, net: null }), stale: true });
     if (!sourceLive() || !freshQuote(long, clock()) || !freshQuote(short, clock()) || contractIdentity(long) !== contractIdentity(p.long) || contractIdentity(short) !== contractIdentity(p.short) || Math.abs(quoteTime(long) - quoteTime(short)) > 5000 || ![long, short].every(q => feed.exchanges.some(x => x.id === q.exchange && x.status === 'live'))) return old();
     try { return { at: Math.min(quoteTime(long), quoteTime(short)), stale: false, ...pnl(p, long.bid, short.ask, feed.fx, clock()) }; } catch { return old(); }
@@ -57,12 +72,38 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     const marks = open.map(valuation);
     return { openCount: open.length, ...store.closedTotals(), usedNotional: open.reduce((n, p) => n + storedNotional(p.longFill) + storedNotional(p.shortFill), 0), unrealizedPnl: marks.some(x => x.stale || x.net === null) ? null : marks.reduce((n, p) => n + p.net, 0), stalePositions: marks.filter(x => x.stale).length };
   }
-  function view() {
-    const positions = [...store.positions('open'), ...store.positions('closed', 200)], publicConfig = { ...config(), hasMonitorPassword: !!store.get('monitorPassword') };
+  function view({ includeHistory = true, historyVersion } = {}) {
+    indexFeed();
+    const positions = store.positions('open'), publicConfig = { ...config(), hasMonitorPassword: !!store.get('monitorPassword') };
     const sourceTimes = (feed?.quotes || []).map(quoteTime).filter(at => Number.isFinite(at) && at > 0 && at <= clock() + 1000);
-    const venues = SUPPORTED_VENUES.map(id => { const upstream = feed?.exchanges.find(x => x.id === id); return { id, state: sourceLive() ? upstream?.status ?? 'unavailable' : 'offline', quoteCount: (feed?.quotes || []).filter(q => q.exchange === id).length }; });
+    const venues = SUPPORTED_VENUES.map(id => { const upstream = feed?.exchanges.find(x => x.id === id); return { id, state: sourceLive() ? upstream?.status ?? 'unavailable' : 'offline', quoteCount: venueCounts.get(id) || 0 }; });
     const fx = ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (error) { return { currency, state: 'unavailable', error: safeMessage(error) }; } });
-    return { mode: 'paper', liveTradingAvailable: false, now: clock(), venues, fx, config: publicConfig, source: { state: sourceLive() ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError, checkedAt: sourceCheckedAt, updatedAt: sourceTimes.length ? Math.max(...sourceTimes) : null, quoteCount: feed?.quotes.length || 0 }, catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError }, totals: totals(positions), opportunities: candidates(), positions: positions.filter(p => p.status === 'open').map(p => ({ ...p, valuation: valuation(p) })), history: positions.filter(p => p.status === 'closed').slice(0, 200), events: store.db.prepare('SELECT at,message FROM events ORDER BY id DESC LIMIT 100').all() };
+    return { mode: 'paper', liveTradingAvailable: false, now: clock(), venues, fx, config: publicConfig, source: { state: sourceLive() ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError, checkedAt: sourceCheckedAt, updatedAt: sourceTimes.length ? Math.max(...sourceTimes) : null, quoteCount: feed?.quotes.length || 0 }, catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError }, totals: totals(positions), opportunities: candidates(), positions: positions.filter(p => p.status === 'open').map(p => ({ ...p, valuation: valuation(p) })), ...(includeHistory ? historyView(historyVersion) : {}) };
+  }
+  // Read only the open positions and aggregate totals; no candidate ranking or history payload.
+  function summary() {
+    indexFeed();
+    const now = clock(), positions = store.positions('open'), value = totals(positions), messages = [];
+    let oldest = Infinity, fresh = 0, expired = 0;
+    for (const q of quoteIndex.values()) { const at = quoteTime(q); if (Number.isFinite(at) && at > 0 && at <= now + 1000) oldest = Math.min(oldest, at); if (freshQuote(q, now)) fresh++; else expired++; }
+    let state = !feed || sourceError ? 'offline' : !sourceLive() || !fresh ? 'stale' : 'online';
+    if (sourceError) messages.push(sourceError);
+    if (expired) messages.push(expired + ' 条盘口过期或时间无效');
+    const unavailable = feed?.exchanges.filter(x => x.status !== 'live').map(x => x.id) || [];
+    if (unavailable.length) messages.push('行情异常：' + unavailable.join('、'));
+    if (feed?.status !== 'live' && feed) messages.push('行情源状态：' + feed.status);
+    if (!catalogAvailable() || catalogError) messages.push(catalogError || 'CrossEx 合约目录未就绪或已过期');
+    if (value.stalePositions) messages.push(value.stalePositions + ' 组持仓估值过期');
+    if (state === 'online' && messages.length) state = 'partial';
+    return { updatedAt: Number.isFinite(oldest) ? new Date(oldest).toISOString() : null,
+      health: { state, message: messages.join('；') || '行情与合约目录正常', staleAfterSeconds: 10 }, metrics: [
+        { key: 'mode', label: '执行模式', value: config().enabled ? '自动模拟' : '模拟已暂停', detail: '仅本地模拟，不发送交易所订单' },
+        { key: 'source', label: '价差信号', value: state, detail: messages.join('；') || '七所同币种永续，按实际汇率折算 USDT' },
+        { key: 'positions', label: '模拟持仓', value: value.openCount, unit: '组' },
+        { key: 'realized', label: '模拟已实现盈亏', value: value.realizedPnl, unit: 'USDT', detail: '已扣手续费，未含资金费；不计入资产账本' },
+        { key: 'unrealized', label: '模拟浮动盈亏', value: value.unrealizedPnl, unit: 'USDT', detail: '按平仓方向盘口估值；过期时不汇总' },
+        { key: 'catalog', label: 'CrossEx 目录', value: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable' },
+      ] };
   }
   function requestResult(requestId, fingerprint) {
     if (typeof requestId !== 'string' || !/^[a-zA-Z0-9:_-]{8,160}$/.test(requestId)) throw new AppError('缺少有效的请求编号');
@@ -148,5 +189,5 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (changed || input.clearMonitorPassword || input.monitorPassword) { feed = null; recentSignals.clear(); sourceError = '连接设置已更改，等待重新读取'; }
     return view();
   }
-  return { view, tick: () => serial(tick), open: (s, r) => serial(() => open(s, r)), closePosition: (id, r) => serial(() => closePosition(id, r)), settings: input => serial(() => settings(input)), async stop() { closing = true; await chain; } };
+  return { view, summary, tick: () => serial(tick), open: (s, r) => serial(() => open(s, r)), closePosition: (id, r) => serial(() => closePosition(id, r)), settings: input => serial(() => settings(input)), async stop() { closing = true; await chain; } };
 }

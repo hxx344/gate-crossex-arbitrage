@@ -1,3 +1,5 @@
+import { createLatestRead } from './latest-read';
+import { useHubBridge, hubChanged, hubNavigate, cleanHubQuery } from './hub-bridge';
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeftRight, RefreshCw, Play, Pause, Settings, Radio, CheckCircle2, AlertCircle } from 'lucide-react';
 import type { Config, Opportunity, Position, State } from './types';
@@ -13,40 +15,74 @@ type Tab = 'opportunities' | 'positions' | 'history' | 'settings';
 const tabs: [Tab, string][] = [['opportunities', '发现机会'], ['positions', '模拟持仓'], ['history', '记录与收益'], ['settings', '连接与设置']];
 
 export default function App() {
+  const hub = useHubBridge('crossex');
   const [state, setState] = useState<State | null>(null), [error, setError] = useState(''), [busy, setBusy] = useState(false), [online, setOnline] = useState(false);
   const [tab, setTab] = useState<Tab>(() => tabs.some(x => x[0] === location.hash.slice(1)) ? location.hash.slice(1) as Tab : 'opportunities');
   const [selectedVenue, setSelectedVenue] = useState('');
+  const [pair, setPair] = useState<{ longExchange?: string; shortExchange?: string }>({});
   const [search, setSearch] = useState(''), [showAll, setShowAll] = useState(false), [now, setNow] = useState(Date.now());
   const requests = useRef(new Map<string, string>());
-  const refresh = useCallback(async (signal?: AbortSignal) => {
-    try { const res = await fetch('/api/state', { signal, cache: 'no-store' }); const data = await res.json(); if (!res.ok) throw new Error(data.error); setState(data); setOnline(true); }
-    catch (e) { if (signal?.aborted) return; setOnline(false); setError(e instanceof Error ? e.message : '模块连接失败'); }
-  }, []);
+  const lifecycle = useRef({ active: hub.active, tab, mutating: false, historyVersion: '' });
+  lifecycle.current.active = hub.active; lifecycle.current.tab = tab;
+  const reader = useRef<ReturnType<typeof createLatestRead<State & { historyVersion?: string }>> | null>(null);
+  if (!reader.current) reader.current = createLatestRead({
+    canRead: () => lifecycle.current.active && !document.hidden && !lifecycle.current.mutating,
+    load: async signal => {
+      const current = lifecycle.current, params = new URLSearchParams({ history: current.tab === 'history' ? '1' : '0' });
+      if (current.historyVersion) params.set('historyVersion', current.historyVersion);
+      const res = await fetch('/api/state?' + params, { signal, cache: 'no-store' }), data = await res.json();
+      if (!res.ok) throw new Error(data.error); return data;
+    },
+    onData: data => {
+      if (data.historyVersion) lifecycle.current.historyVersion = data.historyVersion;
+      setState(previous => ({ ...data, history: data.history ?? previous?.history ?? [], events: data.events ?? previous?.events ?? [] })); setOnline(true); setNow(Date.now());
+    },
+    onError: e => { setOnline(false); setError(e instanceof Error ? e.message : '模块连接失败'); },
+  });
+  const cancelRead = useCallback(() => reader.current?.cancel(), []);
+  const refresh = useCallback((force = false) => reader.current!.refresh(force), []);
   useEffect(() => {
-    const controller = new AbortController(); let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => { setNow(Date.now()); if (!document.hidden) await refresh(controller.signal); if (!controller.signal.aborted) timer = setTimeout(poll, 5000); };
-    void poll(); return () => { controller.abort(); clearTimeout(timer); };
-  }, [refresh]);
+    let timer: ReturnType<typeof setTimeout> | undefined, epoch = 0, stopped = false;
+    const synchronize = () => {
+      const version = ++epoch; clearTimeout(timer); cancelRead();
+      if (!hub.active || document.hidden || stopped) return;
+      const poll = async () => { if (version !== epoch || stopped) return; setNow(Date.now()); await refresh(); if (version === epoch && !stopped) timer = setTimeout(poll, 5000); };
+      void poll();
+    };
+    synchronize(); document.addEventListener('visibilitychange', synchronize);
+    return () => { stopped = true; epoch++; clearTimeout(timer); cancelRead(); document.removeEventListener('visibilitychange', synchronize); };
+  }, [hub.active, tab, refresh, cancelRead]);
+  useEffect(() => {
+    const restore = () => {
+      const params = new URL(location.href).searchParams;
+      const query = cleanHubQuery(Object.fromEntries(['symbol', 'longExchange', 'shortExchange'].flatMap(key => params.has(key) ? [[key, params.get(key)!]] : [])));
+      if (!query) return;
+      setSearch(query.symbol || ''); setPair({ longExchange: query.longExchange, shortExchange: query.shortExchange });
+      if (Object.keys(query).length) { setShowAll(true); setTab('opportunities'); }
+    };
+    restore(); addEventListener('popstate', restore); return () => removeEventListener('popstate', restore);
+  }, []);
   useEffect(() => { const change = () => { const hash = location.hash.slice(1); if (tabs.some(x => x[0] === hash)) setTab(hash as Tab); }; addEventListener('hashchange', change); return () => removeEventListener('hashchange', change); }, []);
   async function mutate(route: string, input: object, method = 'POST', actionKey?: string) {
-    if (!state) return;
+    if (!state || lifecycle.current.mutating) return;
+    lifecycle.current.mutating = true; cancelRead();
     setBusy(true); setError('');
     try {
       if (actionKey && !requests.current.has(actionKey)) {
         const id = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : Array.from(crypto.getRandomValues(new Uint8Array(24)), n => n.toString(16).padStart(2, '0')).join('');
         requests.current.set(actionKey, id);
       }
-      const res = await fetch(route, { method, headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': state.csrfToken }, body: JSON.stringify({ ...input, ...(actionKey ? { requestId: requests.current.get(actionKey) } : {}) }) });
+      const res = await fetch(route, { method, signal: AbortSignal.timeout(30_000), headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': state.csrfToken }, body: JSON.stringify({ ...input, ...(actionKey ? { requestId: requests.current.get(actionKey) } : {}) }) });
       const data = await res.json(); if (!res.ok) throw new Error(data.error);
-      if (actionKey) requests.current.delete(actionKey); await refresh(); return true;
+      if (actionKey) requests.current.delete(actionKey); hubChanged(); lifecycle.current.mutating = false; await refresh(true); return true;
     } catch (e) { setError(e instanceof Error ? e.message : '响应未确认，可重试相同操作；成功的请求不会重复记账'); return false; }
-    finally { setBusy(false); }
+    finally { lifecycle.current.mutating = false; setBusy(false); }
   }
   const go = (value: Tab) => { setTab(value); location.hash = value; setError(''); };
   const stale = !online || !state?.source.updatedAt || now - state.source.updatedAt > 10000 || !['live', 'partial'].includes(state.source.state);
-  const rows = state?.opportunities.filter(x => (showAll || x.eligible) && (!selectedVenue || [x.long.exchange, x.short.exchange].includes(selectedVenue)) && x.base.includes(search.trim().toUpperCase())) || [];
+  const rows = state?.opportunities.filter(x => (showAll || x.eligible) && (!selectedVenue || [x.long.exchange, x.short.exchange].includes(selectedVenue)) && (!pair.longExchange || x.long.exchange === pair.longExchange) && (!pair.shortExchange || x.short.exchange === pair.shortExchange) && x.base.includes(search.trim().toUpperCase())) || [];
   return <div className="app">
-    <header className="topbar"><div className="brand"><span className="brand-icon"><ArrowLeftRight size={25}/></span><div><h1>Gate CrossEx <span className="tag">模拟</span></h1><p>永续价差 · 发现到执行</p></div></div><div className="header-actions"><button disabled={busy} onClick={() => { setError(''); void refresh(); }} aria-label="刷新模块"><RefreshCw size={16}/><span>刷新</span></button><button className={state?.config.enabled ? '' : 'primary'} disabled={!state || busy || !online} onClick={() => void mutate('/api/settings', { config: { enabled: !state?.config.enabled } }, 'PUT')}>{state?.config.enabled ? <Pause size={16}/> : <Play size={16}/>} {state?.config.enabled ? '暂停自动模拟' : '启动自动模拟'}</button></div></header>
+    <header className="topbar"><div className="brand"><span className="brand-icon"><ArrowLeftRight size={25}/></span><div><h1>Gate CrossEx <span className="tag">模拟</span></h1><p>永续价差 · 发现到执行</p></div></div><div className="header-actions">{hub.connected && <button onClick={() => hubNavigate('monitor', { ...(search.trim() ? { symbol: search.trim().toUpperCase() } : {}), ...(pair.longExchange ? { longExchange: pair.longExchange } : {}), ...(pair.shortExchange ? { shortExchange: pair.shortExchange } : {}) })}>在 Monitor 查看</button>}<button disabled={busy} onClick={() => { setError(''); void refresh(); }} aria-label="刷新模块"><RefreshCw size={16}/><span>刷新</span></button><button className={state?.config.enabled ? '' : 'primary'} disabled={!state || busy || !online} onClick={() => void mutate('/api/settings', { config: { enabled: !state?.config.enabled } }, 'PUT')}>{state?.config.enabled ? <Pause size={16}/> : <Play size={16}/>} {state?.config.enabled ? '暂停自动模拟' : '启动自动模拟'}</button></div></header>
     <nav aria-label="模块功能">{tabs.map(([id, label]) => <button key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => go(id)}>{label}{id === 'positions' && !!state?.totals.openCount && <span className="count">{state.totals.openCount}</span>}</button>)}</nav>
     <main><div className="context-line"><span><span className={`status-dot ${state?.config.enabled && !stale ? 'live' : ''}`}/>{state?.config.enabled ? stale ? '自动模拟等待行情' : '自动模拟运行中' : '自动模拟已暂停'}</span><span>仅模拟记账 · 不发送真实订单</span><span>北京时间</span></div>
       {error && <div role="alert" className="notice error"><AlertCircle size={18}/><span>{error}</span><button onClick={() => setError('')} aria-label="关闭提示">×</button></div>}
@@ -54,7 +90,7 @@ export default function App() {
         <section className="metrics" aria-label="模拟概览"><Metric label="已实现模拟盈亏" value={format(state.totals.realizedPnl)} unit="USDT" detail="累计平仓 · 已扣手续费，未含资金费" signed={state.totals.realizedPnl}/><Metric label="浮动模拟盈亏" value={format(stale && state.totals.openCount ? null : state.totals.unrealizedPnl)} unit="USDT" detail={state.totals.stalePositions ? `${state.totals.stalePositions} 组估值过期` : '按平仓方向盘口估值，包含预计平仓费'} signed={state.totals.unrealizedPnl}/><Metric label="模拟持仓" value={String(state.totals.openCount)} unit={`/ ${state.config.maxOpen} 组`} detail={`双腿占用 ${format(state.totals.usedNotional)} / ${format(state.config.maxTotalNotional, 0)} USDT`}/></section>
         <section className="connections" aria-label="数据来源"><div><Radio size={18}/><span><strong>Market Monitor</strong><span className={stale ? 'warning' : 'positive'}>{stale ? stateLabel(state.source.state === 'live' ? 'stale' : state.source.state) : stateLabel(state.source.state)}</span><small>行情源时间 {time(state.source.updatedAt)}</small></span></div><div><CheckCircle2 size={18}/><span><strong>CrossEx 合约目录</strong><span className={state.catalog.state === 'live' ? 'positive' : 'warning'}>{stateLabel(state.catalog.state)}</span><small>核对时间 {time(state.catalog.updatedAt)}</small></span></div>{(state.source.error || state.catalog.error) && <p className="connection-error">{state.source.error || state.catalog.error}<button className="text-button" onClick={() => go('settings')}>检查连接 <Settings size={13}/></button></p>}</section>
         <section className="coverage" aria-label="交易所与汇率"><div className="venue-strip">{state.venues?.map(item => <span key={item.id}><strong>{venue(item.id)}</strong><small className={item.state === 'live' ? 'positive' : 'warning'}>{stateLabel(item.state)} · {item.quoteCount} 个合约</small></span>)}</div><div className="fx-strip">{state.fx?.map(item => <span key={item.currency}>{item.currency} / USDT {item.state === 'live' ? `${format(item.bid, 6)} / ${format(item.ask, 6)} · ${time(item.at)}` : '汇率待更新，该币种暂不模拟'}</span>)}</div></section>
-        {tab === 'opportunities' && <section className="panel"><div className="section-heading"><div><h2>同币种，跨所价差</h2><p>七所永续 · 统一折算 USDT · {state.opportunities.filter(x => x.eligible).length} 个候选通过初筛</p></div><div className="filters"><select aria-label="筛选交易所" value={selectedVenue} onChange={e => setSelectedVenue(e.target.value)}><option value="">全部交易所</option>{Object.entries(venues).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select><input aria-label="搜索币种" placeholder="搜索币种" value={search} onChange={e => setSearch(e.target.value)}/><label className="check"><input type="checkbox" checked={showAll} onChange={e => setShowAll(e.target.checked)}/>显示未通过机会</label></div></div><div className="table-wrap"><table><thead><tr><th>币种 / 方向</th><th>多腿卖一 / 空腿买一</th><th>折算毛价差</th><th>预算净价差</th><th>检查结果</th><th>操作</th></tr></thead><tbody>{rows.slice(0, 100).map(row => <OpportunityRow key={row.pairKey} row={row} disabled={busy || stale} open={() => void mutate('/api/open', { signalId: row.id }, 'POST', `open:${row.id}`)}/>)}</tbody></table></div>{!rows.length && <div className="empty"><ArrowLeftRight size={28}/><h3>{stale ? '等待价差模块的实时信号' : '暂时没有达到阈值的机会'}</h3><p>{stale ? '在连接与设置中填写同机价差服务的登录信息。' : '可显示未通过机会查看原因，或在设置里调整模拟参数。'}</p></div>}<div className="footnote">盘口价格保留原计价币；价差按双边汇率折算 USDT。1 bp = 0.01%。预算净价差 = 盘口毛价差 − 四次手续费 − 四次滑点预算。点击开仓后重新读取双腿深度，按滑点上限与 CrossEx 数量规则复核。</div></section>}
+        {tab === 'opportunities' && <section className="panel"><div className="section-heading"><div><h2>同币种，跨所价差</h2><p>七所永续 · 统一折算 USDT · {state.opportunities.filter(x => x.eligible).length} 个候选通过初筛</p></div><div className="filters">{(pair.longExchange || pair.shortExchange) && <button onClick={() => { setPair({}); const url = new URL(location.href); url.searchParams.delete('longExchange'); url.searchParams.delete('shortExchange'); history.replaceState(null, '', url); }}>清除方向限定</button>}<select aria-label="筛选交易所" value={selectedVenue} onChange={e => setSelectedVenue(e.target.value)}><option value="">全部交易所</option>{Object.entries(venues).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select><input aria-label="搜索币种" placeholder="搜索币种" value={search} onChange={e => setSearch(e.target.value)}/><label className="check"><input type="checkbox" checked={showAll} onChange={e => setShowAll(e.target.checked)}/>显示未通过机会</label></div></div><div className="table-wrap"><table><thead><tr><th>币种 / 方向</th><th>多腿卖一 / 空腿买一</th><th>折算毛价差</th><th>预算净价差</th><th>检查结果</th><th>操作</th></tr></thead><tbody>{rows.slice(0, 100).map(row => <OpportunityRow key={row.pairKey} row={row} disabled={busy || stale} monitor={hub.connected ? () => hubNavigate('monitor', { symbol: row.base, longExchange: row.long.exchange, shortExchange: row.short.exchange }) : undefined} open={() => void mutate('/api/open', { signalId: row.id }, 'POST', `open:${row.id}`)}/>)}</tbody></table></div>{!rows.length && <div className="empty"><ArrowLeftRight size={28}/><h3>{stale ? '等待价差模块的实时信号' : '暂时没有达到阈值的机会'}</h3><p>{stale ? '在连接与设置中填写同机价差服务的登录信息。' : '可显示未通过机会查看原因，或在设置里调整模拟参数。'}</p></div>}<div className="footnote">盘口价格保留原计价币；价差按双边汇率折算 USDT。1 bp = 0.01%。预算净价差 = 盘口毛价差 − 四次手续费 − 四次滑点预算。点击开仓后重新读取双腿深度，按滑点上限与 CrossEx 数量规则复核。</div></section>}
         {tab === 'positions' && <section className="panel"><div className="section-heading"><div><h2>模拟持仓</h2><p>启动自动模拟后按止盈、止损或持有时限平仓；暂停同时停止自动开仓和平仓。</p></div></div>{state.positions.length ? <div className="positions">{state.positions.map(p => <PositionCard key={p.id} p={p} stale={stale} disabled={busy || !online} close={() => void mutate('/api/close', { positionId: p.id }, 'POST', `close:${p.id}`)}/>)}</div> : <div className="empty"><h3>还没有模拟持仓</h3><p>从机会中手动开仓，或开启自动模拟。</p></div>}</section>}
         {tab === 'history' && <><section className="panel"><div className="section-heading"><div><h2>已实现模拟盈亏</h2><p>实际模拟平仓记录累计，单位 USDT；未包含资金费。</p></div></div>{state.history.length ? <Suspense fallback={<div className="empty">加载曲线…</div>}><ProfitChart positions={state.history} total={state.totals.realizedPnl}/></Suspense> : <div className="empty">平仓后显示收益曲线</div>}<div className="table-wrap"><table><thead><tr><th>币种 / 方向</th><th>开仓 / 平仓时间</th><th>数量</th><th>总手续费</th><th>净盈亏 USDT</th><th>平仓原因</th></tr></thead><tbody>{state.history.map(p => <tr key={p.id}><td><strong>{p.base}</strong><small>{direction(p)}</small></td><td>{time(p.openedAt)}<small>{time(p.closedAt)}</small></td><td>{format(p.quantity, 8)}</td><td>{format(p.entryFees + (p.result?.exitFees || 0), 4)}</td><td className={(p.result?.net || 0) < 0 ? 'negative' : 'positive'}>{format(p.result?.net, 4)}</td><td>{p.reason}</td></tr>)}</tbody></table></div><div className="footnote">显示最近 200 笔；累计盈亏包含所有已保存的平仓记录。</div></section><section className="panel event-panel"><h2>运行记录</h2>{state.events.map((e, i) => <div className="event" key={`${e.at}:${i}`}><time>{time(e.at)}</time><span>{e.message}</span></div>)}{!state.events.length && <p className="muted">暂无操作记录</p>}</section></>}
         {tab === 'settings' && <SettingsForm config={state.config} busy={busy} save={value => mutate('/api/settings', value, 'PUT')}/>}
@@ -63,7 +99,7 @@ export default function App() {
     </main></div>;
 }
 function Metric({ label, value, unit, detail, signed }: { label: string; value: string; unit: string; detail: string; signed?: number | null }) { return <div className="metric"><span>{label}</span><div className={signed === undefined || signed === null || value === '—' ? '' : signed < 0 ? 'negative' : 'positive'}><strong>{value}</strong><small>{unit}</small></div><p>{detail}</p></div>; }
-function OpportunityRow({ row, disabled, open }: { row: Opportunity; disabled: boolean; open: () => void }) { return <tr><td><strong>{row.base}</strong><small>{direction(row)}</small></td><td>{format(row.long.ask, 6)} {row.long.quoteCurrency}<small>{format(row.short.bid, 6)} {row.short.quoteCurrency}</small></td><td>{format(row.grossBps)} bp</td><td className={(row.netBps || 0) > 0 ? 'positive' : ''}>{format(row.netBps)} bp</td><td><span className={row.eligible ? 'positive' : 'muted'}>{row.eligible ? '待深度复核' : row.reason}</span>{!!row.warnings?.length && <small className="rule-note">部分目录额度未提供，仅按模拟预算复核</small>}</td><td><button className="primary" disabled={disabled || !row.eligible} onClick={open}>模拟开仓</button></td></tr>; }
+function OpportunityRow({ row, disabled, open, monitor }: { row: Opportunity; disabled: boolean; open: () => void; monitor?: () => void }) { return <tr><td><strong>{row.base}</strong><small>{direction(row)}</small></td><td>{format(row.long.ask, 6)} {row.long.quoteCurrency}<small>{format(row.short.bid, 6)} {row.short.quoteCurrency}</small></td><td>{format(row.grossBps)} bp</td><td className={(row.netBps || 0) > 0 ? 'positive' : ''}>{format(row.netBps)} bp</td><td><span className={row.eligible ? 'positive' : 'muted'}>{row.eligible ? '待深度复核' : row.reason}</span>{!!row.warnings?.length && <small className="rule-note">部分目录额度未提供，仅按模拟预算复核</small>}</td><td><button className="primary" disabled={disabled || !row.eligible} onClick={open}>模拟开仓</button>{monitor && <button onClick={monitor}>在 Monitor 查看</button>}</td></tr>; }
 function PositionCard({ p, stale, disabled, close }: { p: Position; stale: boolean; disabled: boolean; close: () => void }) { return <article className="position"><div className="position-title"><div><h3>{p.base} <span className="tag">双腿模拟持仓</span></h3><p>{direction(p)}</p></div><button onClick={close} disabled={disabled}>模拟平仓</button></div><dl><div><dt>每腿基础币数量</dt><dd>{format(p.quantity, 8)}</dd></div><div><dt>多腿 / 空腿开仓均价</dt><dd>{format(p.longFill.price, 6)} {p.long.quoteCurrency || 'USDT'} / {format(p.shortFill.price, 6)} {p.short.quoteCurrency || 'USDT'}</dd></div><div><dt>预计净盈亏 USDT</dt><dd className={p.valuation.stale || stale ? 'warning' : (p.valuation.net || 0) < 0 ? 'negative' : 'positive'}>{format(p.valuation.net, 4)}{(p.valuation.stale || stale) && ' · 旧估值'}</dd></div><div><dt>开仓时间</dt><dd>{time(p.openedAt)}</dd></div></dl><small className="muted">估值时间 {time(p.valuation.at)} · 平仓重新检查真实深度</small><p className="settlement-note">结算币：多腿 {p.long.settlementCurrency || p.long.quoteCurrency || 'USDT'} / 空腿 {p.short.settlementCurrency || p.short.quoteCurrency || 'USDT'}；收益按结算时汇率折算 USDT</p>{!!p.unverifiedConstraints?.length && <details className="settlement-note"><summary>部分目录规则未提供</summary>{p.unverifiedConstraints.map(note => <p key={note}>{note}</p>)}</details>}</article>; }
 function SettingsForm({ config, busy, save }: { config: Config; busy: boolean; save: (input: object) => Promise<boolean | undefined> }) {
   const [draft, setDraft] = useState(() => { const { hasMonitorPassword: _, ...value } = config; return value; }), [password, setPassword] = useState(''), [clear, setClear] = useState(false), [saved, setSaved] = useState(false);
