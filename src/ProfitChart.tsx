@@ -1,0 +1,8 @@
+import { useMemo } from 'react';
+import { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine } from 'recharts';
+import type { Position } from './types';
+export default function ProfitChart({ positions, total }: { positions: Position[]; total: number }) {
+  const data = useMemo(() => { let value = total - positions.reduce((n, p) => n + (p.result?.net || 0), 0); return [...positions].sort((a, b) => (a.closedAt || 0) - (b.closedAt || 0)).map(p => { value += p.result?.net || 0; return { at: p.closedAt, value }; }); }, [positions, total]);
+  const date = (n: number) => new Date(n).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+  return <div className="profit-chart" role="img" aria-label={`已实现模拟盈亏，最近 ${positions.length} 次平仓，最新累计 ${total.toFixed(4)} USDT。详情见下方表格。`}><ResponsiveContainer width="100%" height="100%" minWidth={0} initialDimension={{ width: 480, height: 260 }}><LineChart data={data} margin={{ top: 12, right: 24, left: 8, bottom: 8 }}><CartesianGrid stroke="#e0e7ef" vertical={false}/><XAxis dataKey="at" type="number" domain={['dataMin', 'dataMax']} tickFormatter={date} minTickGap={60}/><YAxis width={65} tickFormatter={n => Number(n).toFixed(2)}/><Tooltip labelFormatter={v => date(Number(v))} formatter={v => [`${Number(v).toFixed(4)} USDT`, '累计模拟盈亏']}/><ReferenceLine y={0} stroke="#9ca9b8" strokeDasharray="3 3"/><Line type="stepAfter" dataKey="value" stroke="#087f83" strokeWidth={2} dot={{ r: 3 }} isAnimationActive={false}/></LineChart></ResponsiveContainer></div>;
+}
