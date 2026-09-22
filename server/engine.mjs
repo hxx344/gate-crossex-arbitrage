@@ -5,6 +5,7 @@ import { loadCatalog, loadFeed, loadDepth, loadFx } from './clients.mjs';
 const safeMessage = error => error instanceof AppError ? error.message : '读取来源失败，请检查服务连接后重试';
 export function createEngine(store, { catalogReader = loadCatalog, feedReader = loadFeed, depthReader = loadDepth, fxReader = loadFx, clock = Date.now } = {}) {
   let feed = null, sourceError = '等待首次读取价差服务', sourceCheckedAt = null, catalogError = null;
+  let sourceReceivedAt = null, sourceDurationMs = null;
   let catalog = store.get('catalog', { at: 0, items: [] }), catalogAttempt = 0, chain = Promise.resolve(), closing = false;
   let sourceFlight = null, sourceGeneration = 0;
   const recentSignals = new Map();
@@ -35,16 +36,17 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     catch (error) { catalogError = safeMessage(error); }
   }
   async function refreshFeed(generation) {
-    sourceCheckedAt = clock();
+    const startedAt = clock(); sourceCheckedAt = startedAt;
     try {
       const next = await feedReader(config(), store.decrypt(store.get('monitorPassword')));
       if (closing || generation !== sourceGeneration) return;
-      feed = validateFeed(next, clock()); sourceError = null;
+      feed = validateFeed(next, clock()); sourceError = null; sourceReceivedAt = clock();
       for (const [id, signal] of recentSignals) if (!Number.isFinite(signal.expiresAt) || signal.expiresAt < clock()) recentSignals.delete(id);
       for (const signal of feed.signals) if (validSignal(signal, feed, clock())) recentSignals.set(signal.id, signal);
       while (recentSignals.size > 800) recentSignals.delete(recentSignals.keys().next().value);
     }
     catch (error) { if (!closing && generation === sourceGeneration) sourceError = safeMessage(error); }
+    finally { if (!closing && generation === sourceGeneration) sourceDurationMs = Math.max(0, clock() - startedAt); }
   }
   function refreshSource() {
     if (closing) return Promise.resolve();
@@ -73,9 +75,23 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (p.status === 'closed') return { at: p.closedAt, stale: false, ...p.result };
     indexFeed();
     const long = quoteIndex.get(quoteKey(p.long)), short = quoteIndex.get(quoteKey(p.short));
-    const old = () => ({ ...(p.lastValuation || { at: null, net: null }), stale: true });
-    if (!sourceLive() || !freshQuote(long, clock()) || !freshQuote(short, clock()) || contractIdentity(long) !== contractIdentity(p.long) || contractIdentity(short) !== contractIdentity(p.short) || Math.abs(quoteTime(long) - quoteTime(short)) > 5000 || ![long, short].every(q => feed.exchanges.some(x => x.id === q.exchange && x.status === 'live'))) return old();
-    try { return { at: Math.min(quoteTime(long), quoteTime(short)), stale: false, ...pnl(p, long.bid, short.ask, feed.fx, clock()) }; } catch { return old(); }
+    const quoteTimes = { long: Number.isFinite(quoteTime(long)) ? quoteTime(long) : null, short: Number.isFinite(quoteTime(short)) ? quoteTime(short) : null };
+    const old = reason => ({ ...(p.lastValuation || { at: null, net: null }), stale: true, reason, quoteTimes });
+    if (!sourceLive()) return old(sourceError || '价差数据包超过 10 秒，等待来源更新');
+    for (const [q, leg] of [[long, p.long], [short, p.short]]) {
+      if (!q) return old(`${leg.exchange} 缺少该合约盘口`);
+      if (contractIdentity(q) !== contractIdentity(leg)) return old(`${leg.exchange} 合约身份已变化`);
+      if (!freshQuote(q, clock())) {
+        const at = quoteTime(q);
+        if (Number.isFinite(at) && at > 0 && clock() - at > 10000) return old(`${leg.exchange} 盘口已 ${((clock() - at) / 1000).toFixed(1)} 秒未更新`);
+        if (at > clock() + 1000) return old(`${leg.exchange} 盘口时间领先服务器超过 1 秒`);
+        return old(`${leg.exchange} 盘口价格、时间或合约身份无效`);
+      }
+      if (!feed.exchanges.some(x => x.id === q.exchange && x.status === 'live')) return old(`${leg.exchange} 行情连接未就绪`);
+    }
+    const gap = Math.abs(quoteTime(long) - quoteTime(short));
+    if (gap > 5000) return old(`双腿盘口相差 ${(gap / 1000).toFixed(1)} 秒，超过 5 秒同步要求`);
+    try { return { at: Math.min(quoteTime(long), quoteTime(short)), stale: false, quoteTimes, ...pnl(p, long.bid, short.ask, feed.fx, clock()) }; } catch (error) { return old(safeMessage(error)); }
   }
   function totals(positions, marks = null) {
     const open = positions.filter(p => p.status === 'open');
@@ -86,9 +102,10 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     indexFeed();
     const positions = store.positions('open'), publicConfig = { ...config(), hasMonitorPassword: !!store.get('monitorPassword') };
     const sourceTimes = (feed?.quotes || []).map(quoteTime).filter(at => Number.isFinite(at) && at > 0 && at <= clock() + 1000);
+    const hasFreshSource = (feed?.quotes || []).some(q => freshQuote(q, clock()) && feed.exchanges.some(x => x.id === q.exchange && x.status === 'live'));
     const venues = SUPPORTED_VENUES.map(id => { const upstream = feed?.exchanges.find(x => x.id === id); return { id, state: sourceLive() ? upstream?.status ?? 'unavailable' : 'offline', quoteCount: venueCounts.get(id) || 0 }; });
     const fx = ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (error) { return { currency, state: 'unavailable', error: safeMessage(error) }; } });
-    return { mode: 'paper', liveTradingAvailable: false, now: clock(), venues, fx, config: publicConfig, source: { state: sourceLive() ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError, checkedAt: sourceCheckedAt, updatedAt: sourceTimes.length ? Math.max(...sourceTimes) : null, quoteCount: feed?.quotes.length || 0 }, catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError }, totals: totals(positions), opportunities: candidates(), positions: positions.filter(p => p.status === 'open').map(p => ({ ...p, valuation: valuation(p) })), ...(includeHistory ? historyView(historyVersion) : {}) };
+    return { mode: 'paper', liveTradingAvailable: false, now: clock(), venues, fx, config: publicConfig, source: { state: sourceLive() && hasFreshSource ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError, checkedAt: sourceCheckedAt, receivedAt: sourceReceivedAt, durationMs: sourceDurationMs, generatedAt: feed?.generatedAt ?? null, updatedAt: sourceTimes.length ? Math.max(...sourceTimes) : null, quoteCount: feed?.quotes.length || 0 }, catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError }, totals: totals(positions), opportunities: candidates(), positions: positions.filter(p => p.status === 'open').map(p => ({ ...p, valuation: valuation(p) })), ...(includeHistory ? historyView(historyVersion) : {}) };
   }
   // Read only the open positions and aggregate totals; no candidate ranking or history payload.
   function summary() {
@@ -214,7 +231,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (input.clearMonitorPassword !== undefined && typeof input.clearMonitorPassword !== 'boolean') throw new AppError('清除密码选项无效');
     const changed = previous.monitorUrl !== next.monitorUrl || previous.monitorUsername !== next.monitorUsername;
     store.transaction(() => { store.set('config', next); if (changed || input.clearMonitorPassword) store.set('monitorPassword', null); if (input.monitorPassword) store.set('monitorPassword', store.encrypt(input.monitorPassword)); store.event(clock(), next.enabled ? '已开启自动模拟；配置已保存' : '自动模拟已暂停；配置已保存'); });
-    if (changed || input.clearMonitorPassword || input.monitorPassword) { sourceGeneration++; feed = null; recentSignals.clear(); sourceCheckedAt = null; sourceError = '连接设置已更改，等待重新读取'; }
+    if (changed || input.clearMonitorPassword || input.monitorPassword) { sourceGeneration++; feed = null; recentSignals.clear(); sourceCheckedAt = null; sourceReceivedAt = null; sourceDurationMs = null; sourceError = '连接设置已更改，等待重新读取'; }
     return view();
   }
   return { view, summary, refreshSource, tick: options => serial(() => tick(options)), open: (s, r) => serial(() => open(s, r)), closePosition: (id, r) => serial(() => closePosition(id, r)), settings: input => serial(() => settings(input)), async stop() { closing = true; await Promise.all([chain, sourceFlight]); } };

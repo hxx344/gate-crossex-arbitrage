@@ -26,3 +26,20 @@ test('deadline abort reaches transport and leaves a new refresh available', asyn
   const keepAlive = setTimeout(() => {}, 1000);
   try { await reader.refresh(); await reader.refresh(); assert.equal(count, 2); assert.equal(errors.length, 2); assert.equal(errors[0].name, 'TimeoutError'); } finally { clearTimeout(keepAlive); reader.cancel(); }
 });
+
+test('an ignored timeout releases polling and late success or rejection cannot overwrite recovery', async () => {
+  const reads = [], values = [], errors = [];
+  const reader = createLatestRead({ timeoutMs: 5, canRead: () => true,
+    load: () => { const read = deferred(); reads.push(read); return read.promise; },
+    onData: value => values.push(value), onError: error => errors.push(error),
+  });
+  const keepAlive = setTimeout(() => {}, 1000);
+  try {
+    await reader.refresh(); await reader.refresh();
+    const recovered = reader.refresh(); await Promise.resolve(); reads[2].resolve('fresh'); await recovered;
+    reads[0].resolve('obsolete'); reads[1].reject(new Error('late transport failure'));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(values, ['fresh']); assert.equal(errors.length, 2);
+    assert.ok(errors.every(error => error.name === 'TimeoutError'));
+  } finally { clearTimeout(keepAlive); reader.cancel(); }
+});

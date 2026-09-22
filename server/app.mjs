@@ -20,7 +20,7 @@ async function body(req) {
   for await (const chunk of req) { size += chunk.length; if (size > 16384) throw new AppError('请求过大', 413); chunks.push(chunk); }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new AppError('请求格式无效'); }
 }
-export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, publicOrigin = process.env.PUBLIC_ORIGIN || '', intervalMs = 5000, engineOptions, logger = console.log, distDir = path.join(root, 'dist') } = {}) {
+export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, publicOrigin = process.env.PUBLIC_ORIGIN || '', intervalMs = 5000, sourceIntervalMs = intervalMs > 0 ? Math.min(intervalMs, 2000) : 0, engineOptions, logger = console.log, distDir = path.join(root, 'dist') } = {}) {
   const store = createStore(dataDir);
   if (!store.get('password')) {
     const value = initialPassword || randomBytes(18).toString('base64url');
@@ -42,6 +42,9 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     finally { runningTick = false; }
   };
   const timer = intervalMs > 0 ? setInterval(runTick, intervalMs) : null; timer?.unref();
+  // Read quotes faster than the simulation cycle: the source BBO may already be
+  // five seconds old. This lane is single-flight inside the engine.
+  const sourceTimer = sourceIntervalMs > 0 ? setInterval(() => { if (!stopping) void engine.refreshSource(); }, sourceIntervalMs) : null; sourceTimer?.unref();
   if (intervalMs > 0) void runTick();
   async function authenticate(req) {
     const record = store.get('password');
@@ -90,5 +93,5 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     } catch (error) { if (!res.headersSent) json(res, error instanceof AppError ? error.status : 500, { error: error instanceof AppError ? error.message : '操作未完成，请检查服务状态' }); else res.end(); }
   });
   server.requestTimeout = 15000; server.headersTimeout = 10000;
-  return { server, engine, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); validAuth = null; return password; }, async close() { stopping = true; clearInterval(timer); await engine.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
+  return { server, engine, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); validAuth = null; return password; }, async close() { stopping = true; clearInterval(timer); clearInterval(sourceTimer); await engine.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
 }

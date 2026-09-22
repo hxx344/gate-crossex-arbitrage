@@ -7,6 +7,7 @@ import { setImmediate as turn } from 'node:timers/promises';
 import { createApp } from '../server/app.mjs';
 import { AppError } from '../server/model.mjs';
 import { fixture, feed, book, catalog, epoch } from './fixtures.mjs';
+import { STATE_POLL_MS, valuationStaleReason } from '../src/freshness.ts';
 
 function deferred(t) {
   let resolve, reject;
@@ -14,6 +15,42 @@ function deferred(t) {
   t?.after(() => resolve());
   return { promise, resolve, reject };
 }
+
+test('default source cadence keeps held valuations fresh across out-of-phase five-second upstream snapshots', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  async function replay(pageIntervalMs, sourceIntervalMs) {
+    let now = epoch;
+    const directory = mkdtempSync(join(tmpdir(), 'crossex-refresh-test-'));
+    const app = createApp({ dataDir: directory, initialPassword: 'cadence-test-password',
+      ...(sourceIntervalMs ? { sourceIntervalMs } : {}), logger() {},
+      engineOptions: { clock: () => now, catalogReader: async () => catalog,
+        feedReader: async () => {
+          // Snapshot arrives 100 ms after a five-second poll would have run.
+          const at = epoch + Math.floor((now - epoch - 100) / 5000) * 5000 + 100;
+          return { ...feed(at), generatedAt: now };
+        }, depthReader: async q => book(q, now),
+      },
+    });
+    try {
+      await turn(); await app.engine.open(`signal-${epoch - 4900}`, 'cadence-held-position');
+      let displayed = app.engine.view().positions[0].valuation, oldSamples = 0;
+      for (let elapsed = 100; elapsed <= 30000; elapsed += 100) {
+        now = epoch + elapsed; t.mock.timers.tick(100); await turn();
+        // The browser reads just before the next backend poll; include 200 ms
+        // of transit time in the display's conservative age calculation.
+        if (elapsed % pageIntervalMs === pageIntervalMs - 100) displayed = app.engine.view().positions[0].valuation;
+        if (elapsed >= 5000 && valuationStaleReason(displayed, now + 200, false)) oldSamples++;
+      }
+      return oldSamples;
+    } finally {
+      await app.close();
+      if (!directory.startsWith(tmpdir()) || !directory.includes('crossex-refresh-test-')) throw new Error('unsafe path');
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+  assert.ok(await replay(5000, 5000) > 0, 'old cadence reproduces recurring stale valuations');
+  assert.equal(await replay(STATE_POLL_MS), 0, 'new defaults remain fresh for six upstream cycles');
+});
 
 test('overlapping source refreshes share one read and preserve actual quote timestamps', async t => {
   const gate = deferred(t); let reads = 0;
