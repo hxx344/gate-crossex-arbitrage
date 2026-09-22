@@ -6,6 +6,7 @@ const safeMessage = error => error instanceof AppError ? error.message : '读取
 export function createEngine(store, { catalogReader = loadCatalog, feedReader = loadFeed, depthReader = loadDepth, fxReader = loadFx, clock = Date.now } = {}) {
   let feed = null, sourceError = '等待首次读取价差服务', sourceCheckedAt = null, catalogError = null;
   let catalog = store.get('catalog', { at: 0, items: [] }), catalogAttempt = 0, chain = Promise.resolve(), closing = false;
+  let sourceFlight = null, sourceGeneration = 0;
   const recentSignals = new Map();
   let indexedFeed = null, quoteIndex = new Map(), venueCounts = new Map(), cachedHistory = null;
   const historyEpoch = randomUUID();
@@ -22,7 +23,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (cachedHistory?.historyVersion !== version) cachedHistory = { historyVersion: version, history: store.positions('closed', 200), events: store.db.prepare('SELECT at,message FROM events ORDER BY id DESC LIMIT 100').all() };
     return cachedHistory;
   }
-  // All actions and scheduler ticks share one queue; limits and dedup are checked inside it.
+  // Simulation actions remain serialized; read-only source refreshes have their own lane.
   const serial = action => { const result = chain.then(() => { if (closing) throw new AppError('服务正在关闭', 503); return action(); }); chain = result.catch(() => {}); return result; };
   const config = () => store.config();
   function catalogAvailable() { return Array.isArray(catalog.items) && catalog.items.length > 0 && catalog.at <= clock() + 1000 && clock() - catalog.at <= 900000; }
@@ -33,15 +34,24 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     try { const items = await catalogReader(); if (!Array.isArray(items) || !items.length || items.length > 50000) throw new AppError('CrossEx 合约目录无效'); catalog = { at: clock(), items }; store.set('catalog', catalog); catalogError = null; }
     catch (error) { catalogError = safeMessage(error); }
   }
-  async function refreshFeed() {
+  async function refreshFeed(generation) {
     sourceCheckedAt = clock();
     try {
-      const next = await feedReader(config(), store.decrypt(store.get('monitorPassword'))); feed = validateFeed(next, clock()); sourceError = null;
+      const next = await feedReader(config(), store.decrypt(store.get('monitorPassword')));
+      if (closing || generation !== sourceGeneration) return;
+      feed = validateFeed(next, clock()); sourceError = null;
       for (const [id, signal] of recentSignals) if (!Number.isFinite(signal.expiresAt) || signal.expiresAt < clock()) recentSignals.delete(id);
       for (const signal of feed.signals) if (validSignal(signal, feed, clock())) recentSignals.set(signal.id, signal);
       while (recentSignals.size > 800) recentSignals.delete(recentSignals.keys().next().value);
     }
-    catch (error) { sourceError = safeMessage(error); }
+    catch (error) { if (!closing && generation === sourceGeneration) sourceError = safeMessage(error); }
+  }
+  function refreshSource() {
+    if (closing) return Promise.resolve();
+    // Slow reads are shared, never queued. A settings change invalidates both
+    // successful and failed responses from the previous connection.
+    if (!sourceFlight) sourceFlight = refreshFeed(sourceGeneration).finally(() => { sourceFlight = null; });
+    return sourceFlight;
   }
   function sourceLive() { return !sourceError && feed && clock() - feed.generatedAt <= 10000 && feed.generatedAt <= clock() + 1000; }
   function candidates(signals = feed?.signals || []) {
@@ -155,12 +165,17 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     store.transaction(() => { store.savePosition(p); saveResult(requestId, fingerprint, p); store.event(clock(), `${p.base} 已模拟开仓，双腿各 ${quantity}；按可见深度全量撮合`); });
     return p;
   }
+  function checkPositionIdentity(p) {
+    for (const q of [p.long, p.short]) { const current = feed?.quotes.find(x => quoteKey(x) === quoteKey(q)); if (current && contractIdentity(current) !== contractIdentity(q)) throw new AppError('合约身份或结算规则发生变化，暂停此持仓操作'); }
+  }
   async function closePosition(id, requestId, reason = '手动平仓') {
     const fingerprint = `close:${id}`, previous = requestResult(requestId, fingerprint); if (previous) return previous;
     const p = store.findPosition(id);
     if (!p || p.status !== 'open') throw new AppError('持仓不存在或已经平仓', 409);
-    for (const q of [p.long, p.short]) { const current = feed?.quotes.find(x => quoteKey(x) === quoteKey(q)); if (current && contractIdentity(current) !== contractIdentity(q)) throw new AppError('合约身份或结算规则发生变化，暂停此持仓操作'); }
-    const [books, fx] = await Promise.all([Promise.all([depthReader(p.long), depthReader(p.short)]), [p.long, p.short].every(q => settlement(q) === 'USDT') ? null : fxReader()]); validateBooks(books, clock());
+    checkPositionIdentity(p);
+    const [books, fx] = await Promise.all([Promise.all([depthReader(p.long), depthReader(p.short)]), [p.long, p.short].every(q => settlement(q) === 'USDT') ? null : fxReader()]);
+    checkPositionIdentity(p);
+    validateBooks(books, clock());
     const longExit = fill(books[0].bids, p.quantity, 'sell', p.slippageBps), shortExit = fill(books[1].asks, p.quantity, 'buy', p.slippageBps);
     const result = pnl(p, longExit.price, shortExit.price, fx, clock());
     // Profit-triggered exits are rechecked after fetching independent depth snapshots.
@@ -169,8 +184,8 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     store.transaction(() => { store.savePosition(closed); saveResult(requestId, fingerprint, closed); store.event(clock(), `${p.base} ${reason}，模拟净盈亏 ${result.net.toFixed(4)} USDT（未含资金费）`); });
     return closed;
   }
-  async function tick() {
-    await Promise.all([refreshCatalog(), refreshFeed()]);
+  async function tick({ refreshSource: readSource = true } = {}) {
+    await Promise.all([refreshCatalog(), readSource ? refreshSource() : undefined]);
     const positions = store.positions('open');
     for (const p of positions) {
       const value = valuation(p);
@@ -199,8 +214,8 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (input.clearMonitorPassword !== undefined && typeof input.clearMonitorPassword !== 'boolean') throw new AppError('清除密码选项无效');
     const changed = previous.monitorUrl !== next.monitorUrl || previous.monitorUsername !== next.monitorUsername;
     store.transaction(() => { store.set('config', next); if (changed || input.clearMonitorPassword) store.set('monitorPassword', null); if (input.monitorPassword) store.set('monitorPassword', store.encrypt(input.monitorPassword)); store.event(clock(), next.enabled ? '已开启自动模拟；配置已保存' : '自动模拟已暂停；配置已保存'); });
-    if (changed || input.clearMonitorPassword || input.monitorPassword) { feed = null; recentSignals.clear(); sourceError = '连接设置已更改，等待重新读取'; }
+    if (changed || input.clearMonitorPassword || input.monitorPassword) { sourceGeneration++; feed = null; recentSignals.clear(); sourceCheckedAt = null; sourceError = '连接设置已更改，等待重新读取'; }
     return view();
   }
-  return { view, summary, tick: () => serial(tick), open: (s, r) => serial(() => open(s, r)), closePosition: (id, r) => serial(() => closePosition(id, r)), settings: input => serial(() => settings(input)), async stop() { closing = true; await chain; } };
+  return { view, summary, refreshSource, tick: options => serial(() => tick(options)), open: (s, r) => serial(() => open(s, r)), closePosition: (id, r) => serial(() => closePosition(id, r)), settings: input => serial(() => settings(input)), async stop() { closing = true; await Promise.all([chain, sourceFlight]); } };
 }

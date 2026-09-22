@@ -31,7 +31,16 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
   const engine = createEngine(store, engineOptions), csrf = randomBytes(32).toString('base64url');
   let validAuth = null, authRecord = null, failed = 0, failedAt = 0, checkingAuth = 0, runningTick = false, stopping = false;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
-  const runTick = async () => { if (runningTick || stopping) return; runningTick = true; try { await engine.tick(); } catch { logger('模拟服务本轮未完成，等待下一次检查'); } finally { runningTick = false; } };
+  const runTick = async () => {
+    if (stopping) return;
+    // Keep the source current even while a catalog or simulation depth read is slow.
+    const refresh = engine.refreshSource();
+    if (runningTick) return;
+    runningTick = true;
+    try { await refresh; await engine.tick({ refreshSource: false }); }
+    catch { logger('模拟服务本轮未完成，等待下一次检查'); }
+    finally { runningTick = false; }
+  };
   const timer = intervalMs > 0 ? setInterval(runTick, intervalMs) : null; timer?.unref();
   if (intervalMs > 0) void runTick();
   async function authenticate(req) {

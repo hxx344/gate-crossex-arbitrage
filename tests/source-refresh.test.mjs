@@ -1,0 +1,145 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setImmediate as turn } from 'node:timers/promises';
+import { createApp } from '../server/app.mjs';
+import { AppError } from '../server/model.mjs';
+import { fixture, feed, book, catalog, epoch } from './fixtures.mjs';
+
+function deferred(t) {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  t?.after(() => resolve());
+  return { promise, resolve, reject };
+}
+
+test('overlapping source refreshes share one read and preserve actual quote timestamps', async t => {
+  const gate = deferred(t); let reads = 0;
+  const f = fixture(t, { feedReader: async () => { reads++; return gate.promise; } });
+  const first = f.engine.refreshSource(), second = f.engine.refreshSource();
+  assert.equal(reads, 1); assert.equal(first, second);
+  f.advance(20000); gate.resolve({ ...feed(epoch), generatedAt: f.now() });
+  await Promise.all([first, second]);
+  assert.equal(f.engine.summary().health.state, 'stale');
+  assert.equal(f.engine.view().source.updatedAt, epoch);
+  assert.equal(f.engine.view().source.checkedAt, epoch);
+});
+
+for (const failure of [false, true]) {
+  for (const change of [
+    { config: { monitorUrl: 'http://127.0.0.1:3101' } },
+    { config: { monitorUsername: 'replacement' } },
+    { config: {}, monitorPassword: 'replacement-test-password' },
+    { config: {}, clearMonitorPassword: true },
+  ]) {
+    const kind = Object.keys(change.config)[0] || Object.keys(change)[1];
+    test(`connection ${kind} discards obsolete ${failure ? 'failure' : 'success'} and uses new settings`, async t => {
+      const gate = deferred(t), calls = [];
+      const f = fixture(t, { feedReader: async (config, password) => {
+        calls.push({ config, password }); return calls.length === 1 ? gate.promise : feed(f.now());
+      } });
+      await f.engine.settings({ config: {}, monitorPassword: 'original-test-password' });
+      const first = f.engine.refreshSource();
+      await f.engine.settings(change);
+      assert.equal(f.engine.refreshSource(), first, 'settings changes do not overlap requests');
+      if (failure) gate.reject(new AppError('obsolete source failure')); else gate.resolve(feed());
+      await first;
+      assert.equal(f.engine.view().source.quoteCount, 0);
+      assert.equal(f.engine.view().source.checkedAt, null);
+      assert.match(f.engine.view().source.error, /连接设置已更改/);
+      f.advance(5000); await f.engine.refreshSource();
+      assert.equal(calls.length, 2);
+      assert.equal(calls[0].password, 'original-test-password');
+      assert.equal(calls[1].config.monitorUrl, f.store.config().monitorUrl);
+      assert.equal(calls[1].config.monitorUsername, f.store.config().monitorUsername);
+      assert.equal(calls[1].password, change.monitorPassword || '');
+      assert.equal(f.engine.view().source.state, 'live');
+      assert.equal(f.engine.view().source.checkedAt, f.now());
+    });
+  }
+}
+
+for (const failure of [false, true]) test(`stop waits for an active source ${failure ? 'failure' : 'success'} without publishing it`, async t => {
+  const gate = deferred(t); let reads = 0;
+  const f = fixture(t, { feedReader: async () => { reads++; return gate.promise; } });
+  const refresh = f.engine.refreshSource(); let stopped = false;
+  const stop = f.engine.stop().then(() => { stopped = true; });
+  await turn(); assert.equal(stopped, false);
+  await f.engine.refreshSource(); assert.equal(reads, 1);
+  if (failure) gate.reject(new AppError('closing failure')); else gate.resolve(feed());
+  await Promise.all([refresh, stop]);
+  assert.equal(stopped, true); assert.equal(f.engine.view().source.quoteCount, 0);
+  assert.equal(f.engine.view().source.error, '等待首次读取价差服务');
+});
+
+for (const update of ['identity', 'delisting', 'stale', 'failure', 'normal']) test(`open rechecks ${update} source update while reading depth`, async t => {
+  const gate = deferred(t), entered = deferred(); const f = fixture(t);
+  await f.engine.tick();
+  f.setDepth(async q => { entered.resolve(); await gate.promise; return book(q, f.now()); });
+  const opening = f.engine.open(`signal-${epoch}`, `source-${update}-open`);
+  await entered.promise; f.advance(1000);
+  const next = feed(f.now());
+  if (update === 'identity') next.quotes[0].settlementCurrency = 'USD';
+  if (update === 'delisting') next.quotes[0].delisting = true;
+  if (update === 'stale') next.quotes[0].bidAskAt = f.now() - 10001;
+  if (update === 'failure') f.offline(true);
+  f.setFeed(next); await f.engine.refreshSource();
+  gate.resolve();
+  if (update === 'normal') assert.equal((await opening).status, 'open');
+  else { await assert.rejects(opening, /过期/); assert.equal(f.store.positions().length, 0); }
+});
+
+for (const update of ['identity', 'normal', 'offline']) test(`close rechecks identity after ${update} source update without requiring the signal source`, async t => {
+  const gate = deferred(t), entered = deferred(); const f = fixture(t);
+  await f.engine.tick(); const p = await f.engine.open(`signal-${epoch}`, `before-${update}-close`);
+  f.setDepth(async q => { entered.resolve(); await gate.promise; return book(q, f.now()); });
+  const closing = f.engine.closePosition(p.id, `source-${update}-close`);
+  await entered.promise; f.advance(1000);
+  const next = feed(f.now());
+  if (update === 'identity') next.quotes[0].settlementCurrency = 'USD';
+  if (update === 'offline') f.offline(true);
+  f.setFeed(next); await f.engine.refreshSource(); gate.resolve();
+  if (update === 'identity') { await assert.rejects(closing, /身份/); assert.equal(f.store.positions('open').length, 1); }
+  else assert.equal((await closing).status, 'closed');
+});
+
+for (const blocked of ['catalog', 'automatic close']) test(`app keeps refreshing every interval while ${blocked} is blocked`, async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const gate = deferred(t), entered = deferred(); let now = epoch, reads = 0, blockDepth = false, closed = false;
+  const directory = mkdtempSync(join(tmpdir(), 'crossex-refresh-test-'));
+  const app = createApp({ dataDir: directory, initialPassword: 'source-refresh-test-password', intervalMs: 5000,
+    engineOptions: {
+      clock: () => now,
+      feedReader: async () => { reads++; return feed(now); },
+      catalogReader: async () => { if (blocked === 'catalog') { entered.resolve(); await gate.promise; } return catalog; },
+      depthReader: async q => { if (blockDepth) { entered.resolve(); await gate.promise; } return book(q, now); },
+    }, logger() {},
+  });
+  t.after(async () => {
+    if (!closed) await app.close();
+    if (!directory.startsWith(tmpdir()) || !directory.includes('crossex-refresh-test-')) throw new Error('unsafe path');
+    rmSync(directory, { recursive: true, force: true });
+  });
+  await turn();
+  if (blocked === 'automatic close') {
+    const p = await app.engine.open(`signal-${epoch}`, 'before-blocked-close');
+    app.store.savePosition({ ...p, maxHoldMinutes: 0 });
+    await app.engine.settings({ config: { enabled: true } });
+    blockDepth = true; t.mock.timers.tick(5000);
+  }
+  await entered.promise;
+  const initialReads = reads;
+  for (let i = 1; i <= 3; i++) {
+    now += 5000; t.mock.timers.tick(5000); await turn();
+    assert.equal(reads, initialReads + i);
+    assert.equal(app.engine.view().source.checkedAt, now);
+    assert.equal(app.engine.view().source.updatedAt, now);
+    assert.equal(app.engine.view().source.state, 'live');
+  }
+  gate.resolve(); await turn();
+  const beforeClose = reads; await app.close(); closed = true;
+  t.mock.timers.tick(5000); await turn();
+  assert.equal(reads, beforeClose, 'shutdown clears the refresh timer');
+});
