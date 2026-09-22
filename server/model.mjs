@@ -1,20 +1,39 @@
+import { D, Decimal } from './money.mjs';
+
 export class AppError extends Error { constructor(message, status = 400) { super(message); this.status = status; } }
-export const defaults = Object.freeze({ enabled: false, monitorUrl: 'http://127.0.0.1:3000', monitorUsername: 'admin', notionalPerLeg: 100, maxOpen: 3, maxTotalNotional: 1000, feeBps: 6, slippageBps: 5, minNetBps: 20, takeProfitBps: 10, stopLossBps: 100, maxHoldMinutes: 60, cooldownSeconds: 60 });
+export const defaults = Object.freeze({ enabled: false, entryPaused: false, monitorUrl: 'http://127.0.0.1:3000', monitorUsername: 'admin', notionalPerLeg: 100, maxOpen: 3, maxTotalNotional: 1000, feeBps: 6, feeSchedule: Object.freeze([]), slippageBps: 5, minNetBps: 20, takeProfitBps: 10, stopLossBps: 100, maxHoldMinutes: 60, cooldownSeconds: 60, executionMode: 'atomic', executionScenario: 'normal', executionSeed: 1, executionDelayMs: 250, clipNotional: 25, partialFillPct: 50, repairAttempts: 3, fundingEnabled: true, depthRefreshSeconds: 15, historySampleSeconds: 15 });
 export const positive = n => typeof n === 'number' && Number.isFinite(n) && n > 0;
 export function monitorUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048) throw new AppError('价差服务地址无效');
   let url; try { url = new URL(value); } catch { throw new AppError('价差服务地址无效'); }
   if (!['http:', 'https:'].includes(url.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname) || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new AppError('价差服务须为同机 localhost / 127.0.0.1 / [::1] 地址，不含路径或凭据');
   return url.origin;
 }
 export function configuration(input, previous = defaults) {
-  if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(key => !Object.hasOwn(defaults, key))) throw new AppError('配置字段无效');
-  const result = { ...previous, ...input };
-  if (typeof result.enabled !== 'boolean') throw new AppError('自动模拟开关无效');
+  const plain = value => value && typeof value === 'object' && !Array.isArray(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+  const validKeys = (value, allowed) => plain(value) && Reflect.ownKeys(value).every(key => typeof key === 'string' && !['__proto__', 'prototype', 'constructor'].includes(key) && Object.hasOwn(allowed, key));
+  if (!validKeys(input, defaults) || !validKeys(previous, defaults)) throw new AppError('配置字段无效');
+  const result = { ...defaults, ...previous, ...input };
+  for (const key of ['enabled', 'entryPaused', 'fundingEnabled']) if (typeof result[key] !== 'boolean') throw new AppError(`${key} 开关无效`);
   result.monitorUrl = monitorUrl(result.monitorUrl);
   if (typeof result.monitorUsername !== 'string' || result.monitorUsername.length > 100 || /[:\r\n]/.test(result.monitorUsername)) throw new AppError('价差服务用户名无效');
-  const bounds = { notionalPerLeg: [5, 100000], maxOpen: [1, 20], maxTotalNotional: [10, 2000000], feeBps: [0, 100], slippageBps: [0, 100], minNetBps: [0, 5000], takeProfitBps: [1, 5000], stopLossBps: [1, 10000], maxHoldMinutes: [1, 10080], cooldownSeconds: [10, 86400] };
+  const bounds = { notionalPerLeg: [5, 100000], maxOpen: [1, 20], maxTotalNotional: [10, 2000000], feeBps: [0, 100], slippageBps: [0, 100], minNetBps: [0, 5000], takeProfitBps: [1, 5000], stopLossBps: [1, 10000], maxHoldMinutes: [1, 10080], cooldownSeconds: [10, 86400], executionSeed: [1, 2147483648], executionDelayMs: [0, 10000], clipNotional: [1, 100000], partialFillPct: [1, 100], repairAttempts: [1, 10], depthRefreshSeconds: [5, 300], historySampleSeconds: [5, 300] };
   for (const [key, [min, max]] of Object.entries(bounds)) if (typeof result[key] !== 'number' || !Number.isFinite(result[key]) || result[key] < min || result[key] > max) throw new AppError(`${key} 应为 ${min}–${max}`);
-  if (!Number.isInteger(result.maxOpen) || result.maxTotalNotional < result.notionalPerLeg * 2) throw new AppError('持仓数量须为整数，总双腿额度不得低于单腿额度的两倍');
+  for (const key of ['maxOpen', 'executionSeed', 'repairAttempts']) if (!Number.isInteger(result[key])) throw new AppError(`${key} 须为整数`);
+  if (D(result.maxTotalNotional).lt(D(result.notionalPerLeg).times(2))) throw new AppError('总双腿额度不得低于单腿额度的两倍');
+  if (!['atomic', 'staged'].includes(result.executionMode) || !['normal', 'partial', 'reject-short', 'unknown-short', 'cancel-delay', 'cancel-reject'].includes(result.executionScenario)) throw new AppError('执行模式或场景无效');
+  if (!Array.isArray(result.feeSchedule) || result.feeSchedule.length > 100) throw new AppError('费率表最多允许 100 项');
+  const seen = new Set(), fields = { exchange: '', symbol: '', makerBps: 0, takerBps: 0, source: '', updatedAt: null };
+  result.feeSchedule = result.feeSchedule.map(item => {
+    if (!validKeys(item, fields)) throw new AppError('费率表字段无效');
+    const row = { symbol: '', source: 'manual', updatedAt: null, ...item };
+    if (!SUPPORTED_VENUES.includes(row.exchange) || typeof row.symbol !== 'string' || row.symbol.length > 100 || /[\x00-\x1f]/.test(row.symbol) || typeof row.source !== 'string' || !row.source.trim() || row.source.length > 200 || /[\x00-\x1f]/.test(row.source)) throw new AppError('费率交易所、合约或来源无效');
+    if (typeof row.makerBps !== 'number' || !Number.isFinite(row.makerBps) || row.makerBps < -100 || row.makerBps > 100 || typeof row.takerBps !== 'number' || !Number.isFinite(row.takerBps) || row.takerBps < 0 || row.takerBps > 100) throw new AppError('maker 费率须为 -100–100，taker 费率须为 0–100 bps');
+    if (row.updatedAt !== null && (!Number.isSafeInteger(row.updatedAt) || row.updatedAt < 0 || row.updatedAt > 8640000000000000)) throw new AppError('费率更新时间无效');
+    const key = JSON.stringify([row.exchange, row.symbol]);
+    if (seen.has(key)) throw new AppError('费率表包含重复交易所与合约');
+    seen.add(key); return row;
+  });
   return result;
 }
 export const quoteKey = q => `${q.exchange}:${q.symbol}`;
@@ -45,9 +64,11 @@ export function fxRate(currency, fx, now) {
   if (!['USDC', 'USD'].includes(currency) || !rate || !positive(rate.bid) || !positive(rate.ask) || rate.ask < rate.bid || !Number.isFinite(rate.at) || rate.at <= 0 || rate.at > now + 1000 || !positive(age) || now - rate.at > age || typeof rate.source !== 'string' || !rate.source) throw new AppError(`${currency} / USDT 汇率缺失或过期`);
   return rate;
 }
-export function convert(value, currency, fx, now) { const rate = fxRate(currency, fx, now); return value * (value >= 0 ? rate.bid : rate.ask); }
-export function referencePrice(q, price, side, fx, now) { return price * fxRate(q.quoteCurrency, fx, now)[side === 'buy' ? 'ask' : 'bid']; }
-export function notionalUSDT(q, amount, fx, now) { return amount * fxRate(settlement(q), fx, now).ask; }
+const converted = (value, currency, fx, now) => { const amount = D(value), rate = fxRate(currency, fx, now); return amount.times(amount.gte(0) ? rate.bid : rate.ask); };
+const notionalConverted = (q, amount, fx, now) => D(amount).times(fxRate(settlement(q), fx, now).ask);
+export function convert(value, currency, fx, now) { return converted(value, currency, fx, now).toNumber(); }
+export function referencePrice(q, price, side, fx, now) { return D(price).times(fxRate(q.quoteCurrency, fx, now)[side === 'buy' ? 'ask' : 'bid']).toNumber(); }
+export function notionalUSDT(q, amount, fx, now) { return notionalConverted(q, amount, fx, now).toNumber(); }
 export const storedNotional = fill => fill.notionalUSDT ?? fill.notional;
 export function quoteTime(q) { return Math.min(q?.bidAskAt ?? NaN, q?.receivedAt ?? NaN); }
 export function freshQuote(q, now) {
@@ -81,19 +102,24 @@ export function catalogRule(q, catalog) {
 }
 const SCALE = 100000000n;
 function units(value) {
-  if (!/^\d+(?:\.\d{1,8})?$/.test(String(value))) throw new AppError('数量步长精度超出模拟器支持范围');
-  const [a, b = ''] = String(value).split('.'); return BigInt(a) * SCALE + BigInt(b.padEnd(8, '0'));
+  let decimal; try { decimal = D(value); } catch { throw new AppError('数量步长精度超出模拟器支持范围'); }
+  if (decimal.isNegative() || decimal.decimalPlaces() > 8) throw new AppError('数量步长精度超出模拟器支持范围');
+  return BigInt(decimal.times(SCALE.toString()).toFixed(0));
 }
 function gcd(a, b) { while (b) [a, b] = [b, a % b]; return a; }
-export function commonQuantity(budget, prices, rules, budgetPrices = prices) {
+function quantityDecimal(budget, prices, rules, budgetPrices = prices) {
+  if (!Array.isArray(prices) || !Array.isArray(budgetPrices) || !Array.isArray(rules) || prices.length !== 2 || budgetPrices.length !== 2 || rules.length !== 2) throw new AppError('双腿额度或数量规则无效');
   const steps = rules.map(x => units(x.lot_size));
   if (!positive(budget) || [...prices, ...budgetPrices].some(n => !positive(n)) || steps.some(n => n <= 0n)) throw new AppError('额度或数量规则无效');
   const step = steps[0] / gcd(steps[0], steps[1]) * steps[1];
-  const max = Math.min(budget / Math.max(...budgetPrices), ...rules.filter(x => x.max_market_size !== null).map(x => Number(x.max_market_size)));
-  const quantity = Number(BigInt(Math.floor(max * Number(SCALE))) / step * step) / Number(SCALE);
-  if (!positive(quantity) || rules.some((r, i) => quantity < Number(r.min_size) || (r.min_notional !== null && quantity * prices[i] < Number(r.min_notional)))) throw new AppError('额度取整后未满足双腿最小数量或最小名义额');
+  const max = Decimal.min(D(budget).div(Decimal.max(...budgetPrices)), ...rules.filter(x => x.max_market_size !== null).map(x => D(x.max_market_size)));
+  const scaled = BigInt(max.times(SCALE.toString()).floor().toFixed(0));
+  const quantity = D((scaled / step * step).toString()).div(SCALE.toString());
+  if (quantity.lte(0) || rules.some((r, i) => quantity.lt(r.min_size) || (r.min_notional !== null && quantity.times(prices[i]).lt(r.min_notional)))) throw new AppError('额度取整后未满足双腿最小数量或最小名义额');
   return quantity;
 }
+export const commonQuantity = (...args) => quantityDecimal(...args).toNumber();
+export const commonQuantityExact = (...args) => quantityDecimal(...args).toString();
 export function validateBooks(books, now) {
   for (const book of books) {
     if (!Number.isFinite(book.at) || now - book.at > 10000 || book.at > now + 1000) throw new AppError('深度快照已经过期或时间异常');
@@ -105,19 +131,52 @@ export function validateBooks(books, now) {
   }
   if (Math.abs(books[0].at - books[1].at) > 5000) throw new AppError('双腿深度时间差超过 5 秒');
 }
-export function fill(levels, quantity, side, slippageBps) {
-  const top = levels[0][0], limit = top * (1 + (side === 'buy' ? 1 : -1) * slippageBps / 10000);
-  let remaining = quantity, value = 0;
-  for (const [price, available] of levels) {
-    if (side === 'buy' ? price > limit + 1e-12 : price < limit - 1e-12) break;
-    const take = Math.min(remaining, available); value += take * price; remaining -= take;
-    if (remaining < quantity * 1e-10) return { quantity, price: value / quantity, notional: value, status: 'filled' };
+export function partialFill(levels, quantity, side, slippageBps) {
+  let requested, slippage;
+  try { requested = D(quantity); slippage = D(slippageBps); } catch { throw new AppError('成交数量或滑点无效'); }
+  if (!Array.isArray(levels) || requested.lte(0) || slippage.lt(0) || slippage.gt(10000) || !['buy', 'sell'].includes(side)) throw new AppError('成交数量或滑点无效');
+  let remaining = requested, value = D(0), limit;
+  for (const level of levels) {
+    if (!Array.isArray(level) || level.length < 2) throw new AppError('成交深度无效');
+    let price, available;
+    try { price = D(level[0]); available = D(level[1]); } catch { throw new AppError('成交深度无效'); }
+    if (price.lte(0) || available.lte(0)) throw new AppError('成交深度无效');
+    limit ??= price.times(D(1).plus(slippage.div(10000).times(side === 'buy' ? 1 : -1)));
+    if (side === 'buy' ? price.gt(limit) : price.lt(limit)) break;
+    const take = Decimal.min(remaining, available);
+    value = value.plus(take.times(price)); remaining = remaining.minus(take);
+    if (remaining.isZero()) break;
   }
-  throw new AppError('滑点上限内深度不足，双腿模拟均未记账');
+  const actual = requested.minus(remaining), price = actual.isZero() ? null : value.div(actual);
+  return { quantity: actual.toNumber(), requestedQuantity: requested.toNumber(), remaining: remaining.toNumber(), price: price?.toNumber() ?? null, notional: value.toNumber(), status: actual.isZero() ? 'empty' : remaining.isZero() ? 'filled' : 'partial', exact: { quantity: actual.toString(), requestedQuantity: requested.toString(), remaining: remaining.toString(), price: price?.toString() ?? null, notional: value.toString() } };
+}
+export function fill(levels, quantity, side, slippageBps) {
+  const result = partialFill(levels, quantity, side, slippageBps);
+  if (result.status !== 'filled') throw new AppError('滑点上限内深度不足，双腿模拟均未记账');
+  return result;
 }
 export function pnl(position, longExit, shortExit, fx, now = Date.now()) {
-  const longGross = position.quantity * (longExit - position.longFill.price), shortGross = position.quantity * (position.shortFill.price - shortExit);
-  const gross = convert(longGross, settlement(position.long), fx, now) + convert(shortGross, settlement(position.short), fx, now);
-  const exitFees = (notionalUSDT(position.long, position.quantity * longExit, fx, now) + notionalUSDT(position.short, position.quantity * shortExit, fx, now)) * position.feeBps / 10000;
-  return { gross, exitFees, net: gross - position.entryFees - exitFees, longGross, shortGross };
+  const quantities = { long: position.longQuantity ?? position.longFill?.exact?.quantity ?? position.longFill?.quantity ?? position.quantity, short: position.shortQuantity ?? position.shortFill?.exact?.quantity ?? position.shortFill?.quantity ?? position.quantity };
+  const notional = (execution, quantity) => {
+    if (quantity.isZero()) return D(0);
+    if (execution && typeof execution === 'object' && !(execution instanceof Decimal)) {
+      if (execution.exact?.notional !== undefined && D(execution.exact.quantity ?? execution.quantity ?? quantity).eq(quantity)) return D(execution.exact.notional);
+      return quantity.times(execution.exact?.price ?? execution.price);
+    }
+    return quantity.times(execution);
+  };
+  const parts = {};
+  for (const [leg, exit] of [['long', longExit], ['short', shortExit]]) {
+    const quantity = D(quantities[leg]), entryValue = notional(position[`${leg}Fill`], quantity), exitValue = notional(exit, quantity);
+    const rawGross = leg === 'long' ? exitValue.minus(entryValue) : entryValue.minus(exitValue);
+    const exitBps = position.feeSnapshot?.[leg]?.exit?.bps ?? position.feeBps;
+    parts[leg] = { rawGross, gross: quantity.isZero() ? D(0) : converted(rawGross, settlement(position[leg]), fx, now), exitFees: quantity.isZero() ? D(0) : notionalConverted(position[leg], exitValue, fx, now).times(exitBps).div(10000) };
+  }
+  const gross = parts.long.gross.plus(parts.short.gross), exitFees = parts.long.exitFees.plus(parts.short.exitFees);
+  const entryFees = D(position.exact?.entryFees ?? position.entryFeesExact ?? position.entryFees);
+  const priceOnlyNet = gross.minus(entryFees).minus(exitFees);
+  let grossAtEntryFx = null;
+  try { grossAtEntryFx = converted(parts.long.rawGross, settlement(position.long), position.entryFx, position.openedAt ?? now).plus(converted(parts.short.rawGross, settlement(position.short), position.entryFx, position.openedAt ?? now)); } catch { /* Legacy entries may lack a valid historical FX reference. */ }
+  const values = { gross, entryFees, exitFees, net: priceOnlyNet, priceOnlyNet, longGross: parts.long.rawGross, shortGross: parts.short.rawGross };
+  return { ...Object.fromEntries(Object.entries(values).map(([key, value]) => [key, value.toNumber()])), grossAtEntryFx: grossAtEntryFx?.toNumber() ?? null, fxImpact: grossAtEntryFx === null ? null : gross.minus(grossAtEntryFx).toNumber(), exact: Object.fromEntries(Object.entries(values).map(([key, value]) => [key, value.toString()])) };
 }

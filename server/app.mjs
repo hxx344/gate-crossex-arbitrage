@@ -1,19 +1,17 @@
 import http from 'node:http';
-import { randomBytes, scryptSync, scrypt, timingSafeEqual, createHash } from 'node:crypto';
-import { promisify } from 'node:util';
+import { randomBytes, scryptSync, timingSafeEqual, createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createStore } from './store.mjs';
 import { createEngine } from './engine.mjs';
 import { AppError } from './model.mjs';
+import { createAuthenticator } from './auth.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const digest = value => createHash('sha256').update(value).digest();
 const equal = (a, b) => timingSafeEqual(digest(a), digest(b));
 const makePassword = value => { const salt = randomBytes(16).toString('hex'); return `${salt}:${scryptSync(value, salt, 64).toString('hex')}`; };
-const derive = promisify(scrypt);
-const matches = async (value, record) => { const [salt, encoded] = record.split(':'); return timingSafeEqual(await derive(value, salt, 64), Buffer.from(encoded, 'hex')); };
 async function body(req) {
   if (!/^application\/json(?:;|$)/i.test(req.headers['content-type'] || '')) throw new AppError('请使用 JSON 请求', 415);
   let size = 0; const chunks = [];
@@ -29,7 +27,8 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     if (!initialPassword) logger(`CrossEx 初始登录信息：admin / ${value}\n首次显示，请保存。重置：node server/setup.mjs --reset-password`);
   }
   const engine = createEngine(store, engineOptions), csrf = randomBytes(32).toString('base64url');
-  let validAuth = null, authRecord = null, failed = 0, failedAt = 0, checkingAuth = 0, runningTick = false, stopping = false;
+  const auth = createAuthenticator({ getRecord: () => store.get('password') });
+  let runningTick = false, stopping = false;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
   const runTick = async () => {
     if (stopping) return;
@@ -37,7 +36,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     const refresh = engine.refreshSource();
     if (runningTick) return;
     runningTick = true;
-    try { await refresh; await engine.tick({ refreshSource: false }); }
+    try { await refresh; await engine.tick({ refreshSource: false }); void engine.refreshAccounting(); void engine.refreshValuations(); }
     catch { logger('模拟服务本轮未完成，等待下一次检查'); }
     finally { runningTick = false; }
   };
@@ -47,20 +46,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
   const sourceTimer = sourceIntervalMs > 0 ? setInterval(() => { if (!stopping) void engine.refreshSource(); }, sourceIntervalMs) : null; sourceTimer?.unref();
   if (intervalMs > 0) void runTick();
   async function authenticate(req) {
-    const record = store.get('password');
-    if (authRecord !== record) { validAuth = null; authRecord = record; failed = 0; }
-    const authorization = req.headers.authorization || '';
-    if (validAuth && equal(authorization, validAuth)) return true;
-    if (Date.now() - failedAt > 900000) { failed = 0; failedAt = Date.now(); }
-    if (!authorization.startsWith('Basic ') || authorization.length > 2048) return false;
-    const decoded = Buffer.from(authorization.slice(6), 'base64').toString('utf8'), colon = decoded.indexOf(':');
-    if (checkingAuth >= 4) throw new AppError('登录校验繁忙，请稍后重试', 429);
-    checkingAuth++;
-    try {
-      if (decoded.slice(0, colon) === 'admin' && await matches(decoded.slice(colon + 1), record) && record === store.get('password')) { validAuth = authorization; failed = 0; return true; }
-      failed++; if (failed >= 10) throw new AppError('登录信息不正确，请检查密码后重试', 429);
-      return false;
-    } finally { checkingAuth--; }
+    return auth.authenticate(req.headers.authorization || '');
   }
   const server = http.createServer(async (req, res) => {
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('Referrer-Policy', 'no-referrer');
@@ -82,6 +68,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
       if (route === '/api/settings' && req.method === 'PUT') return json(res, 200, await engine.settings(await body(req)));
       if (route === '/api/open' && req.method === 'POST') { const input = await body(req); return json(res, 200, await engine.open(input.signalId, input.requestId)); }
       if (route === '/api/close' && req.method === 'POST') { const input = await body(req); return json(res, 200, await engine.closePosition(input.positionId, input.requestId)); }
+      if (route === '/api/execution' && req.method === 'POST') { const input = await body(req); return json(res, 200, await engine.executionAction(input.executionId, input.action, input.requestId)); }
       if (route.startsWith('/api/')) throw new AppError('不支持此接口或请求方法', 404);
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new AppError('不支持此请求方法', 405);
       const asset = route === '/' ? 'index.html' : route.replace(/^\//, '');
@@ -93,5 +80,5 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     } catch (error) { if (!res.headersSent) json(res, error instanceof AppError ? error.status : 500, { error: error instanceof AppError ? error.message : '操作未完成，请检查服务状态' }); else res.end(); }
   });
   server.requestTimeout = 15000; server.headersTimeout = 10000;
-  return { server, engine, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); validAuth = null; return password; }, async close() { stopping = true; clearInterval(timer); clearInterval(sourceTimer); await engine.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
+  return { server, engine, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); auth.reset(); return password; }, async close() { stopping = true; clearInterval(timer); clearInterval(sourceTimer); await engine.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
 }

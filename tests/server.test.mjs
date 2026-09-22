@@ -55,8 +55,13 @@ test('HTTP open and close are idempotent across repeated delivery', async t => {
 });
 test('wrong-password bursts do not lock out a subsequent correct login', async t => {
   const f = await fixture(t);
-  for (let i = 0; i < 11; i++) await f.request('/api/state', { headers: { Authorization: `Basic ${Buffer.from(`admin:incorrect-${i}`).toString('base64')}` } });
+  for (let i = 0; i < 11; i++) {
+    const attempt = await f.request('/api/state', { headers: { Authorization: `Basic ${Buffer.from(`admin:incorrect-${i}`).toString('base64')}` } });
+    assert.equal(attempt.status, i < 9 ? 401 : 429);
+  }
+  const started = Date.now();
   assert.equal((await f.request('/api/state')).status, 200);
+  assert.ok(Date.now() - started < 5000, 'first correct login remains inside the Hub five-second timeout');
 });
 
 

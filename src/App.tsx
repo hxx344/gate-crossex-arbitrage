@@ -1,17 +1,14 @@
 import { createLatestRead } from './latest-read';
 import { createServerClock, sourceIsStale, valuationStaleReason, STATE_POLL_MS } from './freshness';
 import { useHubBridge, hubChanged, hubNavigate, cleanHubQuery } from './hub-bridge';
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeftRight, RefreshCw, Play, Pause, Settings, Radio, CheckCircle2, AlertCircle } from 'lucide-react';
-import type { Config, Opportunity, Position, State } from './types';
+import type { Opportunity, State } from './types';
+import { direction, format, signedClass, stateLabel, time, venue, venues } from './display';
+import SettingsForm from './SettingsForm';
+import PositionsPanel from './PositionsPanel';
+import HistoryPanel from './HistoryPanel';
 
-const ProfitChart = lazy(() => import('./ProfitChart'));
-const format = (n: number | null | undefined, digits = 2) => n === null || n === undefined || !Number.isFinite(n) ? '—' : n.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits });
-const time = (value: number | null | undefined) => value ? new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '等待数据';
-const venues: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX', gate: 'Gate', kraken: 'Kraken', hyperliquid: 'Hyperliquid', lighter: 'Lighter' };
-const venue = (name: string) => venues[name] || name;
-const direction = (row: { long: { exchange: string }; short: { exchange: string } }) => `${venue(row.long.exchange)} 做多 → ${venue(row.short.exchange)} 做空`;
-const stateLabel = (state: string) => ({ live: '已连接', partial: '部分行情可用', offline: '未连接', stale: '数据过期', cached: '使用缓存', unavailable: '等待连接', connecting: '连接中', error: '连接异常', disabled: '未启用' }[state] || state);
 type Tab = 'opportunities' | 'positions' | 'history' | 'settings';
 const tabs: [Tab, string][] = [['opportunities', '发现机会'], ['positions', '模拟持仓'], ['history', '记录与收益'], ['settings', '连接与设置']];
 
@@ -39,7 +36,7 @@ export default function App() {
     onData: ({ requestStartedAt, ...data }) => {
       serverClock.current.sample(data.now, requestStartedAt);
       if (data.historyVersion) lifecycle.current.historyVersion = data.historyVersion;
-      setState(previous => ({ ...data, history: data.history ?? previous?.history ?? [], events: data.events ?? previous?.events ?? [] })); setOnline(true); setReadError(''); setNow(serverClock.current.now());
+      setState(previous => ({ ...data, history: data.history ?? previous?.history ?? [], events: data.events ?? previous?.events ?? [], analytics: data.analytics ?? previous?.analytics, executions: data.executions ?? [] })); setOnline(true); setReadError(''); setNow(serverClock.current.now());
     },
     onError: e => { setOnline(false); setReadError(e instanceof Error ? e.name === 'TimeoutError' ? '读取状态超时，正在自动重试' : e.message : '模块连接失败，正在自动重试'); },
   });
@@ -87,29 +84,109 @@ export default function App() {
   const stale = sourceIsStale(state?.source, now, online);
   const stalePositions = state?.positions.filter(p => valuationStaleReason(p.valuation, now, stale)).length || 0;
   const rows = state?.opportunities.filter(x => (showAll || x.eligible) && (!selectedVenue || [x.long.exchange, x.short.exchange].includes(selectedVenue)) && (!pair.longExchange || x.long.exchange === pair.longExchange) && (!pair.shortExchange || x.short.exchange === pair.shortExchange) && x.base.includes(search.trim().toUpperCase())) || [];
-  return <div className="app">
-    <header className="topbar"><div className="brand"><span className="brand-icon"><ArrowLeftRight size={25}/></span><div><h1>Gate CrossEx <span className="tag">模拟</span></h1><p>永续价差 · 发现到执行</p></div></div><div className="header-actions">{hub.connected && <button onClick={() => hubNavigate('monitor', { ...(search.trim() ? { symbol: search.trim().toUpperCase() } : {}), ...(pair.longExchange ? { longExchange: pair.longExchange } : {}), ...(pair.shortExchange ? { shortExchange: pair.shortExchange } : {}) })}>在 Monitor 查看</button>}<button disabled={busy} onClick={() => { setError(''); void refresh(); }} aria-label="刷新模块"><RefreshCw size={16}/><span>刷新</span></button><button className={state?.config.enabled ? '' : 'primary'} disabled={!state || busy || !online} onClick={() => void mutate('/api/settings', { config: { enabled: !state?.config.enabled } }, 'PUT')}>{state?.config.enabled ? <Pause size={16}/> : <Play size={16}/>} {state?.config.enabled ? '暂停自动模拟' : '启动自动模拟'}</button></div></header>
-    <nav aria-label="模块功能">{tabs.map(([id, label]) => <button key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => go(id)}>{label}{id === 'positions' && !!state?.totals.openCount && <span className="count">{state.totals.openCount}</span>}</button>)}</nav>
-    <main><div className="context-line"><span><span className={`status-dot ${state?.config.enabled && !stale ? 'live' : ''}`}/>{state?.config.enabled ? stale ? '自动模拟等待行情' : '自动模拟运行中' : '自动模拟已暂停'}</span><span>仅模拟记账 · 不发送真实订单</span><span>北京时间</span></div>
-      {(error || readError) && <div role="alert" className="notice error"><AlertCircle size={18}/><span>{error || readError}</span><button onClick={() => { setError(''); setReadError(''); }} aria-label="关闭提示">×</button></div>}
-      {!state ? <div className="empty panel">正在读取模块状态…</div> : <>
-        <section className="metrics" aria-label="模拟概览"><Metric label="已实现模拟盈亏" value={format(state.totals.realizedPnl)} unit="USDT" detail="累计平仓 · 已扣手续费，未含资金费" signed={state.totals.realizedPnl}/><Metric label="浮动模拟盈亏" value={format(stalePositions ? null : state.totals.unrealizedPnl)} unit="USDT" detail={stalePositions ? `${stalePositions} 组估值过期` : '按平仓方向盘口估值，包含预计平仓费'} signed={state.totals.unrealizedPnl}/><Metric label="模拟持仓" value={String(state.totals.openCount)} unit={`/ ${state.config.maxOpen} 组`} detail={`双腿占用 ${format(state.totals.usedNotional)} / ${format(state.config.maxTotalNotional, 0)} USDT`}/></section>
-        <section className="connections" aria-label="数据来源"><div><Radio size={18}/><span><strong>Market Monitor</strong><span className={stale ? 'warning' : 'positive'}>{stale ? stateLabel(['live', 'partial'].includes(state.source.state) ? 'stale' : state.source.state) : stateLabel(state.source.state)}</span><small>行情源时间 {time(state.source.updatedAt)}</small><small>最近读取成功 {time(state.source.receivedAt)}{state.source.durationMs != null && ` · 上次请求耗时 ${format(state.source.durationMs / 1000, 2)} 秒`}</small></span></div><div><CheckCircle2 size={18}/><span><strong>CrossEx 合约目录</strong><span className={state.catalog.state === 'live' ? 'positive' : 'warning'}>{stateLabel(state.catalog.state)}</span><small>核对时间 {time(state.catalog.updatedAt)}</small></span></div>{(state.source.error || state.catalog.error) && <p className="connection-error">{state.source.error || state.catalog.error}<button className="text-button" onClick={() => go('settings')}>检查连接 <Settings size={13}/></button></p>}</section>
-        <section className="coverage" aria-label="交易所与汇率"><div className="venue-strip">{state.venues?.map(item => <span key={item.id}><strong>{venue(item.id)}</strong><small className={item.state === 'live' ? 'positive' : 'warning'}>{stateLabel(item.state)} · {item.quoteCount} 个合约</small></span>)}</div><div className="fx-strip">{state.fx?.map(item => <span key={item.currency}>{item.currency} / USDT {item.state === 'live' ? `${format(item.bid, 6)} / ${format(item.ask, 6)} · ${time(item.at)}` : '汇率待更新，该币种暂不模拟'}</span>)}</div></section>
-        {tab === 'opportunities' && <section className="panel"><div className="section-heading"><div><h2>同币种，跨所价差</h2><p>七所永续 · 统一折算 USDT · {state.opportunities.filter(x => x.eligible).length} 个候选通过初筛</p></div><div className="filters">{(pair.longExchange || pair.shortExchange) && <button onClick={() => { setPair({}); const url = new URL(location.href); url.searchParams.delete('longExchange'); url.searchParams.delete('shortExchange'); history.replaceState(null, '', url); }}>清除方向限定</button>}<select aria-label="筛选交易所" value={selectedVenue} onChange={e => setSelectedVenue(e.target.value)}><option value="">全部交易所</option>{Object.entries(venues).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select><input aria-label="搜索币种" placeholder="搜索币种" value={search} onChange={e => setSearch(e.target.value)}/><label className="check"><input type="checkbox" checked={showAll} onChange={e => setShowAll(e.target.checked)}/>显示未通过机会</label></div></div><div className="table-wrap"><table><thead><tr><th>币种 / 方向</th><th>多腿卖一 / 空腿买一</th><th>折算毛价差</th><th>预算净价差</th><th>检查结果</th><th>操作</th></tr></thead><tbody>{rows.slice(0, 100).map(row => <OpportunityRow key={row.pairKey} row={row} disabled={busy || stale} monitor={hub.connected ? () => hubNavigate('monitor', { symbol: row.base, longExchange: row.long.exchange, shortExchange: row.short.exchange }) : undefined} open={() => void mutate('/api/open', { signalId: row.id }, 'POST', `open:${row.id}`)}/>)}</tbody></table></div>{!rows.length && <div className="empty"><ArrowLeftRight size={28}/><h3>{stale ? '等待价差模块的实时信号' : '暂时没有达到阈值的机会'}</h3><p>{stale ? '在连接与设置中填写同机价差服务的登录信息。' : '可显示未通过机会查看原因，或在设置里调整模拟参数。'}</p></div>}<div className="footnote">盘口价格保留原计价币；价差按双边汇率折算 USDT。1 bp = 0.01%。预算净价差 = 盘口毛价差 − 四次手续费 − 四次滑点预算。点击开仓后重新读取双腿深度，按滑点上限与 CrossEx 数量规则复核。</div></section>}
-        {tab === 'positions' && <section className="panel"><div className="section-heading"><div><h2>模拟持仓</h2><p>启动自动模拟后按止盈、止损或持有时限平仓；暂停同时停止自动开仓和平仓。</p></div></div>{state.positions.length ? <div className="positions">{state.positions.map(p => <PositionCard key={p.id} p={p} staleReason={valuationStaleReason(p.valuation, now, stale)} disabled={busy || !online} close={() => void mutate('/api/close', { positionId: p.id }, 'POST', `close:${p.id}`)}/>)}</div> : <div className="empty"><h3>还没有模拟持仓</h3><p>从机会中手动开仓，或开启自动模拟。</p></div>}</section>}
-        {tab === 'history' && <><section className="panel"><div className="section-heading"><div><h2>已实现模拟盈亏</h2><p>实际模拟平仓记录累计，单位 USDT；未包含资金费。</p></div></div>{state.history.length ? <Suspense fallback={<div className="empty">加载曲线…</div>}><ProfitChart positions={state.history} total={state.totals.realizedPnl}/></Suspense> : <div className="empty">平仓后显示收益曲线</div>}<div className="table-wrap"><table><thead><tr><th>币种 / 方向</th><th>开仓 / 平仓时间</th><th>数量</th><th>总手续费</th><th>净盈亏 USDT</th><th>平仓原因</th></tr></thead><tbody>{state.history.map(p => <tr key={p.id}><td><strong>{p.base}</strong><small>{direction(p)}</small></td><td>{time(p.openedAt)}<small>{time(p.closedAt)}</small></td><td>{format(p.quantity, 8)}</td><td>{format(p.entryFees + (p.result?.exitFees || 0), 4)}</td><td className={(p.result?.net || 0) < 0 ? 'negative' : 'positive'}>{format(p.result?.net, 4)}</td><td>{p.reason}</td></tr>)}</tbody></table></div><div className="footnote">显示最近 200 笔；累计盈亏包含所有已保存的平仓记录。</div></section><section className="panel event-panel"><h2>运行记录</h2>{state.events.map((e, i) => <div className="event" key={`${e.at}:${i}`}><time>{time(e.at)}</time><span>{e.message}</span></div>)}{!state.events.length && <p className="muted">暂无操作记录</p>}</section></>}
-        {tab === 'settings' && <SettingsForm config={state.config} busy={busy} save={value => mutate('/api/settings', value, 'PUT')}/>}
-        <p className="model-note">模拟模型：双腿在可见深度内都能全量成交才记账，均价包含逐档滑点。同币种等量对冲未覆盖汇率风险；Hyperliquid 的 USDT 报价合约以 USDC 结算。未模拟实盘的排队、延迟、单腿成交、强平和资金费；结果不能视为可实现收益。无需交易所 API Key。</p>
-      </>}
-    </main></div>;
+  const activeExecutions = state?.totals.activeExecutions || 0;
+  const enabled = !!state?.config.enabled, entryPaused = !!state?.config.entryPaused;
+  const statusText = !enabled ? '全部自动已暂停' : entryPaused ? '新仓已暂停 · 继续退出管理' : stale ? '自动模拟等待行情' : '自动模拟运行中';
+  return (
+    <div className="app">
+      <header className="topbar">
+        <div className="brand">
+          <span className="brand-icon"><ArrowLeftRight size={25}/></span>
+          <div><h1>Gate CrossEx <span className="tag">模拟</span></h1><p>永续价差 · 发现到执行</p></div>
+        </div>
+        <div className="header-actions">
+          {hub.connected && <button onClick={() => hubNavigate('monitor', {
+            ...(search.trim() ? { symbol: search.trim().toUpperCase() } : {}),
+            ...(pair.longExchange ? { longExchange: pair.longExchange } : {}),
+            ...(pair.shortExchange ? { shortExchange: pair.shortExchange } : {}),
+          })}>在 Monitor 查看</button>}
+          <button disabled={busy} onClick={() => { setError(''); void refresh(); }} aria-label="刷新模块"><RefreshCw size={16}/><span>刷新</span></button>
+          <button disabled={!state || busy || !online} onClick={() => void mutate('/api/settings', { config: { entryPaused: !entryPaused } }, 'PUT')}>
+            {entryPaused ? <Play size={16}/> : <Pause size={16}/>} {entryPaused ? '允许新仓' : '只暂停新仓'}
+          </button>
+          <button className={enabled ? '' : 'primary'} disabled={!state || busy || !online} onClick={() => void mutate('/api/settings', { config: { enabled: !enabled } }, 'PUT')}>
+            {enabled ? <Pause size={16}/> : <Play size={16}/>} {enabled ? '暂停全部自动' : '启动自动模拟'}
+          </button>
+        </div>
+      </header>
+      <nav aria-label="模块功能">{tabs.map(([id, label]) => (
+        <button key={id} aria-current={tab === id ? 'page' : undefined} onClick={() => go(id)}>
+          {label}
+          {id === 'positions' && !!state && !!(state.totals.openCount + activeExecutions) && <span className="count">{state.totals.openCount} 仓{activeExecutions ? ' / ' + activeExecutions + ' 任务' : ''}</span>}
+        </button>
+      ))}</nav>
+      <main>
+        <div className="context-line">
+          <span><span className={'status-dot ' + (enabled && !stale ? 'live' : '')}/>{statusText}</span>
+          <span>仅模拟记账 · 不发送真实订单</span><span>北京时间</span>
+        </div>
+        {(error || readError) && <div role="alert" className="notice error"><AlertCircle size={18}/><span>{error || readError}</span><button onClick={() => { setError(''); setReadError(''); }} aria-label="关闭提示">×</button></div>}
+        {!state ? <div className="empty panel">正在读取模块状态…</div> : <>
+          <section className="metrics expanded-metrics" aria-label="模拟概览">
+            <Metric label="累计模拟净值" value={format(stalePositions ? null : state.totals.netWithFunding)} unit="USDT"
+              detail={stalePositions ? stalePositions + ' 组估值过期，完整净值暂不可用' : state.totals.fundingComplete ? '已实现 + 浮盈 + 已确认资金费' : '资金费未完整确认，保留缺失值'} signed={state.totals.netWithFunding}/>
+            <Metric label="已实现价差盈亏" value={format(state.totals.realizedPnl)} unit="USDT" detail={'已扣手续费 · 含资金费 ' + format(state.totals.realizedWithFunding) + ' USDT'} signed={state.totals.realizedPnl}/>
+            <Metric label="BBO 参考浮盈" value={format(stalePositions ? null : state.totals.unrealizedPnl)} unit="USDT"
+              detail={stalePositions ? stalePositions + ' 组估值过期' : '不含资金费 · 平仓还需逐档复核'} signed={state.totals.unrealizedPnl}/>
+            <Metric label="模拟持仓 / 任务" value={String(state.totals.openCount)} unit={'/ ' + state.config.maxOpen + ' 组'}
+              detail={'占用 ' + format(state.totals.usedNotional) + ' · 预留 ' + format(state.totals.reservedNotional ?? 0) + ' USDT · ' + activeExecutions + ' 个执行任务'}/>
+          </section>
+          {activeExecutions > 0 && tab !== 'positions' && <div className="execution-banner"><span>{activeExecutions} 个分阶段任务待完成，已知资金费合计 {format(state.totals.fundingKnown, 4)} USDT</span><button className="text-button" onClick={() => go('positions')}>查看执行与暴露</button></div>}
+          <section className="connections" aria-label="数据来源">
+            <div><Radio size={18}/><span><strong>Market Monitor</strong><span className={stale ? 'warning' : 'positive'}>{stale ? stateLabel(['live', 'partial'].includes(state.source.state) ? 'stale' : state.source.state) : stateLabel(state.source.state)}</span>
+              <small>行情源时间 {time(state.source.updatedAt)}</small>
+              <small>最近读取成功 {time(state.source.receivedAt)}{state.source.durationMs != null && ' · 请求耗时 ' + format(state.source.durationMs / 1000, 2) + ' 秒'}</small>
+            </span></div>
+            <div><CheckCircle2 size={18}/><span><strong>CrossEx 合约目录</strong><span className={state.catalog.state === 'live' ? 'positive' : 'warning'}>{stateLabel(state.catalog.state)}</span><small>核对时间 {time(state.catalog.updatedAt)}</small></span></div>
+            {(state.source.error || state.catalog.error) && <p className="connection-error">{state.source.error || state.catalog.error}<button className="text-button" onClick={() => go('settings')}>检查连接 <Settings size={13}/></button></p>}
+          </section>
+          <section className="coverage" aria-label="交易所与汇率">
+            <div className="venue-strip">{state.venues?.map(item => <span key={item.id}><strong>{venue(item.id)}</strong><small className={item.state === 'live' ? 'positive' : 'warning'}>{stateLabel(item.state)} · {item.quoteCount} 个合约</small></span>)}</div>
+            <div className="fx-strip">{state.fx?.map(item => <span key={item.currency}>{item.currency} / USDT {item.state === 'live' ? format(item.bid, 6) + ' / ' + format(item.ask, 6) + ' · ' + time(item.at) : '汇率待更新，该币种暂不模拟'}</span>)}</div>
+          </section>
+          {tab === 'opportunities' && <section className="panel">
+            <div className="section-heading">
+              <div><h2>同币种，跨所价差</h2><p>七所永续 · 统一折算 USDT · {state.opportunities.filter(x => x.eligible).length} 个候选通过初筛</p></div>
+              <div className="filters">
+                {(pair.longExchange || pair.shortExchange) && <button onClick={() => { setPair({}); const url = new URL(location.href); url.searchParams.delete('longExchange'); url.searchParams.delete('shortExchange'); history.replaceState(null, '', url); }}>清除方向限定</button>}
+                <select aria-label="筛选交易所" value={selectedVenue} onChange={e => setSelectedVenue(e.target.value)}><option value="">全部交易所</option>{Object.entries(venues).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select>
+                <input aria-label="搜索币种" placeholder="搜索币种" value={search} onChange={e => setSearch(e.target.value)}/>
+                <label className="check"><input type="checkbox" checked={showAll} onChange={e => setShowAll(e.target.checked)}/>显示未通过机会</label>
+              </div>
+            </div>
+            {entryPaused && <div className="inline-state warning" role="status">新仓已暂停；允许新仓后可继续手动或自动开仓，已有持仓仍按当前自动开关管理。</div>}
+            <div className="table-wrap"><table>
+              <thead><tr><th>币种 / 方向</th><th>多腿卖一 / 空腿买一</th><th>折算毛价差</th><th>预算净价差</th><th>检查结果</th><th>操作</th></tr></thead>
+              <tbody>{rows.slice(0, 100).map(row => <OpportunityRow key={row.pairKey} row={row} staged={state.config.executionMode === 'staged'} disabled={busy || stale || entryPaused}
+                monitor={hub.connected ? () => hubNavigate('monitor', { symbol: row.base, longExchange: row.long.exchange, shortExchange: row.short.exchange }) : undefined}
+                open={() => void mutate('/api/open', { signalId: row.id }, 'POST', 'open:' + row.id)}/>)}</tbody>
+            </table></div>
+            {!rows.length && <div className="empty"><ArrowLeftRight size={28}/><h3>{stale ? '等待价差模块的实时信号' : '暂时没有达到阈值的机会'}</h3><p>{stale ? '在连接与设置中填写同机价差服务的登录信息。' : '可显示未通过机会查看原因，或在设置里调整模拟参数。'}</p></div>}
+            <div className="footnote">盘口价格保留原计价币；价差按双边汇率折算 USDT。预算净价差扣除多空双腿开仓与退出四次费率及四次滑点预算，资金费单独核算。当前为{state.config.executionMode === 'staged' ? '分阶段模拟，开仓后在“模拟持仓”跟踪订单与修复' : '双腿原子模拟，全量可成交后才记账'}。</div>
+          </section>}
+          {tab === 'positions' && <PositionsPanel state={state} now={now} stale={stale} online={online} busy={busy}
+            close={id => void mutate('/api/close', { positionId: id }, 'POST', 'close:' + id)}
+            executionAction={(id, action) => void mutate('/api/execution', { executionId: id, action }, 'POST', 'execution:' + action + ':' + id)}/>}
+          {tab === 'history' && <HistoryPanel state={state} online={online}/>}
+          {tab === 'settings' && <SettingsForm config={state.config} busy={busy} save={value => mutate('/api/settings', value, 'PUT')}/>}
+          <p className="model-note">模拟模型：原子模式复核双腿全量成交；分阶段模式记录分批、单腿暴露、拒单、状态待确认和修复。均价包含逐档滑点，手续费与可确认资金费单独记账；预估和未知资金费不冒充已实现收入。未覆盖真实撮合排队、强平和完整保证金约束；同币种等量对冲仍有结算币汇率风险。无需交易所 API Key。</p>
+        </>}
+      </main>
+    </div>
+  );
 }
-function Metric({ label, value, unit, detail, signed }: { label: string; value: string; unit: string; detail: string; signed?: number | null }) { return <div className="metric"><span>{label}</span><div className={signed === undefined || signed === null || value === '—' ? '' : signed < 0 ? 'negative' : 'positive'}><strong>{value}</strong><small>{unit}</small></div><p>{detail}</p></div>; }
-function OpportunityRow({ row, disabled, open, monitor }: { row: Opportunity; disabled: boolean; open: () => void; monitor?: () => void }) { return <tr><td><strong>{row.base}</strong><small>{direction(row)}</small></td><td>{format(row.long.ask, 6)} {row.long.quoteCurrency}<small>{format(row.short.bid, 6)} {row.short.quoteCurrency}</small></td><td>{format(row.grossBps)} bp</td><td className={(row.netBps || 0) > 0 ? 'positive' : ''}>{format(row.netBps)} bp</td><td><span className={row.eligible ? 'positive' : 'muted'}>{row.eligible ? '待深度复核' : row.reason}</span>{!!row.warnings?.length && <small className="rule-note">部分目录额度未提供，仅按模拟预算复核</small>}</td><td><button className="primary" disabled={disabled || !row.eligible} onClick={open}>模拟开仓</button>{monitor && <button onClick={monitor}>在 Monitor 查看</button>}</td></tr>; }
-function PositionCard({ p, staleReason, disabled, close }: { p: Position; staleReason: string; disabled: boolean; close: () => void }) { return <article className="position"><div className="position-title"><div><h3>{p.base} <span className="tag">双腿模拟持仓</span></h3><p>{direction(p)}</p></div><button onClick={close} disabled={disabled}>模拟平仓</button></div><dl><div><dt>每腿基础币数量</dt><dd>{format(p.quantity, 8)}</dd></div><div><dt>多腿 / 空腿开仓均价</dt><dd>{format(p.longFill.price, 6)} {p.long.quoteCurrency || 'USDT'} / {format(p.shortFill.price, 6)} {p.short.quoteCurrency || 'USDT'}</dd></div><div><dt>预计净盈亏 USDT</dt><dd className={staleReason ? 'warning' : (p.valuation.net || 0) < 0 ? 'negative' : 'positive'}>{format(p.valuation.net, 4)}{(staleReason) && ' · 旧估值'}</dd></div><div><dt>开仓时间</dt><dd>{time(p.openedAt)}</dd></div></dl><small className="muted">估值时间 {time(p.valuation.at)} · 平仓重新检查真实深度</small>{staleReason && <p className="settlement-note warning">{staleReason}{p.valuation.quoteTimes && <><br/>多腿盘口 {time(p.valuation.quoteTimes.long)} · 空腿盘口 {time(p.valuation.quoteTimes.short)}</>}</p>}<p className="settlement-note">结算币：多腿 {p.long.settlementCurrency || p.long.quoteCurrency || 'USDT'} / 空腿 {p.short.settlementCurrency || p.short.quoteCurrency || 'USDT'}；收益按结算时汇率折算 USDT</p>{!!p.unverifiedConstraints?.length && <details className="settlement-note"><summary>部分目录规则未提供</summary>{p.unverifiedConstraints.map(note => <p key={note}>{note}</p>)}</details>}</article>; }
-function SettingsForm({ config, busy, save }: { config: Config; busy: boolean; save: (input: object) => Promise<boolean | undefined> }) {
-  const [draft, setDraft] = useState(() => { const { hasMonitorPassword: _, ...value } = config; return value; }), [password, setPassword] = useState(''), [clear, setClear] = useState(false), [saved, setSaved] = useState(false);
-  useEffect(() => { setDraft(value => ({ ...value, enabled: config.enabled })); }, [config.enabled]);
-  const numeric: [keyof Config, string, string][] = [['notionalPerLeg', '单腿名义额', 'USDT'], ['maxTotalNotional', '双腿总名义额上限', 'USDT'], ['maxOpen', '最多同时持仓', '组'], ['feeBps', '每次成交手续费', 'bp'], ['slippageBps', '每次成交滑点上限', 'bp'], ['minNetBps', '最低预算净价差', 'bp'], ['takeProfitBps', '止盈 / 单腿开仓额', 'bp'], ['stopLossBps', '止损 / 单腿开仓额', 'bp'], ['maxHoldMinutes', '最长持有', '分钟'], ['cooldownSeconds', '同币种平仓后冷却', '秒']];
-  return <form onSubmit={async e => { e.preventDefault(); setSaved(false); if (await save({ config: draft, ...(password ? { monitorPassword: password } : {}), clearMonitorPassword: clear })) { setSaved(true); setPassword(''); setClear(false); } }}><section className="panel settings-panel"><h2>价差服务连接</h2><p className="muted">填写 Market Monitor 的网页登录信息，密码仅加密保存在此模块服务器。</p><div className="form-grid"><label>同机服务地址<input required value={draft.monitorUrl} onChange={e => setDraft({ ...draft, monitorUrl: e.target.value })}/></label><label>登录用户名<input value={draft.monitorUsername} autoComplete="off" onChange={e => setDraft({ ...draft, monitorUsername: e.target.value })}/></label><label>登录密码<input type="password" value={password} autoComplete="new-password" placeholder={config.hasMonitorPassword ? '已保存，留空保留' : '尚未保存'} onChange={e => setPassword(e.target.value)}/></label></div><label className="check"><input type="checkbox" checked={clear} onChange={e => setClear(e.target.checked)}/>清除已保存的价差服务密码</label><p className="footnote">更换地址或用户名会清除旧密码。修改后的 Monitor 需要提供机会接口；默认地址为 http://127.0.0.1:3000。</p></section><section className="panel settings-panel"><h2>模拟策略参数</h2><p className="muted">手续费是模拟假设，不代表你的 CrossEx 账户费率。参数变更仅影响后续开仓，已有持仓保留开仓时的平仓规则。</p><div className="form-grid">{numeric.map(([key, label, unit]) => <label key={key}>{label}<div className="input-unit"><input required type="number" step={key === 'maxOpen' ? '1' : 'any'} value={Number(draft[key as keyof typeof draft])} onChange={e => setDraft({ ...draft, [key]: Number(e.target.value) })}/><span>{unit}</span></div></label>)}</div><label className="check"><input type="checkbox" checked={draft.enabled} onChange={e => setDraft({ ...draft, enabled: e.target.checked })}/>启用自动模拟开仓与平仓</label><div className="save-row"><button className="primary" disabled={busy} type="submit">保存设置</button>{saved && <span role="status" className="positive">已保存</span>}</div></section></form>;
+
+function Metric({ label, value, unit, detail, signed }: { label: string; value: string; unit: string; detail: string; signed?: number | null }) {
+  return <div className="metric"><span>{label}</span><div className={value === '—' ? '' : signedClass(signed)}><strong>{value}</strong><small>{unit}</small></div><p>{detail}</p></div>;
+}
+
+function OpportunityRow({ row, disabled, staged, open, monitor }: { row: Opportunity; disabled: boolean; staged: boolean; open: () => void; monitor?: () => void }) {
+  return <tr>
+    <td><strong>{row.base}</strong><small>{direction(row)}</small></td>
+    <td>{format(row.long.ask, 6)} {row.long.quoteCurrency}<small>{format(row.short.bid, 6)} {row.short.quoteCurrency}</small></td>
+    <td>{format(row.grossBps)} bp</td>
+    <td className={signedClass(row.netBps)}>{format(row.netBps)} bp{row.feeSnapshot && <small>往返费率 {format(row.feeSnapshot.long.entry.bps + row.feeSnapshot.long.exit.bps + row.feeSnapshot.short.entry.bps + row.feeSnapshot.short.exit.bps)} bp</small>}</td>
+    <td><span className={row.eligible ? 'positive' : 'muted'}>{row.eligible ? '待深度复核' : row.reason}</span>{!!row.warnings?.length && <small className="rule-note">部分目录额度未提供，仅按模拟预算复核</small>}</td>
+    <td><div className="row-actions"><button className="primary" disabled={disabled || !row.eligible} onClick={open}>{staged ? '分阶段开仓' : '模拟开仓'}</button>{monitor && <button onClick={monitor}>在 Monitor 查看</button>}</div></td>
+  </tr>;
 }

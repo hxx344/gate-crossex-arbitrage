@@ -32,6 +32,9 @@ test('equal base-quantity uses the exact common lot, with minimum and maximum si
   assert.equal(commonQuantity(100, [100, 102], rules), 0.978);
   assert.throws(() => commonQuantity(1, [100, 102], rules));
   assert.equal(commonQuantity(1000, [100, 102], rules.map(r => ({ ...r, max_market_size: '0.1' }))), 0.096);
+  const centRules = rules.map(r => ({ ...r, lot_size: '0.01', min_size: '0.01', min_notional: '0', max_market_size: '0.29' }));
+  assert.equal(commonQuantity(100, [1, 1], centRules), 0.29);
+  assert.equal(commonQuantity(0.29, [1, 1], centRules.map(r => ({ ...r, max_market_size: null }))), 0.29);
 });
 test('depth walks levels, never double counts slippage, and rejects partial fills', () => {
   const result = fill([[100, 1], [101, 2]], 2, 'buy', 100); assert.equal(result.price, 100.5); assert.equal(result.notional, 201);
