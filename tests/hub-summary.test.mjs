@@ -12,7 +12,7 @@ test('light summary distinguishes absent, stale, partial quotes and directory fa
   const mixed = feed(epoch); mixed.quotes[0].bidAskAt = epoch - 12000; mixed.signals = [];
   f.setFeed(mixed); await f.engine.tick();
   const partial = f.engine.summary(); assert.equal(partial.health.state, 'partial'); assert.match(partial.health.message, /盘口过期/);
-  assert.equal(partial.updatedAt, new Date(epoch - 12000).toISOString()); assert.equal(partial.health.staleAfterSeconds, 10);
+  assert.equal(partial.updatedAt, new Date(epoch).toISOString()); assert.equal(partial.health.staleAfterSeconds, 10);
   f.advance(11000); assert.equal(f.engine.summary().health.state, 'stale');
   f.offline(true); await f.engine.tick(); assert.equal(f.engine.summary().health.state, 'offline');
   f.offline(false); f.advance(900001); f.setFeed(feed(f.now())); f.setCatalog([]); await f.engine.tick();

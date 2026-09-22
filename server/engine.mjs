@@ -67,9 +67,9 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (!sourceLive() || !freshQuote(long, clock()) || !freshQuote(short, clock()) || contractIdentity(long) !== contractIdentity(p.long) || contractIdentity(short) !== contractIdentity(p.short) || Math.abs(quoteTime(long) - quoteTime(short)) > 5000 || ![long, short].every(q => feed.exchanges.some(x => x.id === q.exchange && x.status === 'live'))) return old();
     try { return { at: Math.min(quoteTime(long), quoteTime(short)), stale: false, ...pnl(p, long.bid, short.ask, feed.fx, clock()) }; } catch { return old(); }
   }
-  function totals(positions) {
+  function totals(positions, marks = null) {
     const open = positions.filter(p => p.status === 'open');
-    const marks = open.map(valuation);
+    marks ??= open.map(valuation);
     return { openCount: open.length, ...store.closedTotals(), usedNotional: open.reduce((n, p) => n + storedNotional(p.longFill) + storedNotional(p.shortFill), 0), unrealizedPnl: marks.some(x => x.stale || x.net === null) ? null : marks.reduce((n, p) => n + p.net, 0), stalePositions: marks.filter(x => x.stale).length };
   }
   function view({ includeHistory = true, historyVersion } = {}) {
@@ -83,19 +83,32 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
   // Read only the open positions and aggregate totals; no candidate ranking or history payload.
   function summary() {
     indexFeed();
-    const now = clock(), positions = store.positions('open'), value = totals(positions), messages = [];
-    let oldest = Infinity, fresh = 0, expired = 0;
-    for (const q of quoteIndex.values()) { const at = quoteTime(q); if (Number.isFinite(at) && at > 0 && at <= now + 1000) oldest = Math.min(oldest, at); if (freshQuote(q, now)) fresh++; else expired++; }
+    const now = clock(), positions = store.positions('open'), marks = positions.map(valuation), value = totals(positions, marks), messages = [];
+    const liveVenues = new Set(feed?.exchanges.filter(x => x.status === 'live').map(x => x.id));
+    let oldest = Infinity, latestFresh = -Infinity, fresh = 0, expired = 0;
+    for (const q of quoteIndex.values()) {
+      const at = quoteTime(q);
+      if (Number.isFinite(at) && at > 0 && at <= now + 1000) oldest = Math.min(oldest, at);
+      if (freshQuote(q, now) && liveVenues.has(q.exchange)) { fresh++; latestFresh = Math.max(latestFresh, at); }
+      else expired++;
+    }
     let state = !feed || sourceError ? 'offline' : !sourceLive() || !fresh ? 'stale' : 'online';
+    let updatedAt = oldest;
+    if (state === 'online') {
+      // A partial feed is still active while usable quotes arrive. Neither a
+      // request heartbeat nor a newer unrelated quote may freshen held PnL.
+      updatedAt = Math.min(feed.generatedAt, latestFresh);
+      if (value.unrealizedPnl !== null) for (const mark of marks) updatedAt = Math.min(updatedAt, mark.at);
+    }
     if (sourceError) messages.push(sourceError);
-    if (expired) messages.push(expired + ' 条盘口过期或时间无效');
+    if (expired) messages.push(expired + ' 条盘口过期、无效或交易所未连接');
     const unavailable = feed?.exchanges.filter(x => x.status !== 'live').map(x => x.id) || [];
     if (unavailable.length) messages.push('行情异常：' + unavailable.join('、'));
     if (feed?.status !== 'live' && feed) messages.push('行情源状态：' + feed.status);
     if (!catalogAvailable() || catalogError) messages.push(catalogError || 'CrossEx 合约目录未就绪或已过期');
     if (value.stalePositions) messages.push(value.stalePositions + ' 组持仓估值过期');
     if (state === 'online' && messages.length) state = 'partial';
-    return { updatedAt: Number.isFinite(oldest) ? new Date(oldest).toISOString() : null,
+    return { updatedAt: Number.isFinite(updatedAt) ? new Date(updatedAt).toISOString() : null,
       health: { state, message: messages.join('；') || '行情与合约目录正常', staleAfterSeconds: 10 }, metrics: [
         { key: 'mode', label: '执行模式', value: config().enabled ? '自动模拟' : '模拟已暂停', detail: '仅本地模拟，不发送交易所订单' },
         { key: 'source', label: '价差信号', value: state, detail: messages.join('；') || '七所同币种永续，按实际汇率折算 USDT' },
