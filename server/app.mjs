@@ -66,7 +66,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
         const value = engine.view();
         return json(res, 200, { schemaVersion: 1, data: { updatedAt: new Date(value.source.updatedAt || 0).toISOString(), metrics: [
           { key: 'mode', label: '执行模式', value: value.config.enabled ? '自动模拟' : '模拟已暂停', detail: '仅本地模拟，不发送交易所订单' },
-          { key: 'source', label: '价差信号', value: value.source.state, detail: value.source.error || '仅 Binance / Bybit 同币种 USDT 永续' },
+          { key: 'source', label: '价差信号', value: value.source.state, detail: value.source.error || '七所同币种永续，按实际汇率折算 USDT' },
           { key: 'positions', label: '模拟持仓', value: value.totals.openCount, unit: '组' },
           { key: 'realized', label: '模拟已实现盈亏', value: value.totals.realizedPnl, unit: 'USDT', detail: '扣除配置手续费，未含资金费；不计入资产账本' },
           { key: 'unrealized', label: '模拟浮动盈亏', value: value.totals.unrealizedPnl, unit: 'USDT', detail: '按平仓方向盘口估值；过期时不汇总' },

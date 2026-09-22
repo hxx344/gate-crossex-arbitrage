@@ -8,14 +8,17 @@
 
 ```text
 Market Monitor 公共行情与价差发现
-  → /api/monitors/perpetual/opportunities
+  → /api/monitors/perpetual/opportunities-v2
   → CrossEx 合约可用性、数量与额度检查
-  → Binance / Bybit 公共深度复核
+  → 七所公共深度与 USDC / USD 汇率复核
   → 模拟双腿开仓 → 持仓估值 → 模拟平仓 → SQLite 记录
   → 工作台独立入口与摘要（不计入真实资产）
 ```
 
-- 首版是 Binance / Bybit 同币种、USDT 计价与结算、单位为 1 的加密永续。支持集合由 Monitor 身份证据与 CrossEx 当前合约目录共同决定，具体范围见 [联动接口](https://github.com/hxx344/market-spread-monitor/blob/main/docs/CROSSEX_SIGNALS.md)。未知标的、倍数合约、跨计价币和已知下架合约不参与开仓。
+- 支持 Binance、Bybit、OKX、Gate、Kraken、Hyperliquid、Lighter 七所，明确排除 Deribit。仅同币种、单位为 1 的普通加密永续；支持集合由 Monitor 当前身份资料与 CrossEx 合约目录共同决定。未知标的、倍数、盘前、非加密及已知下架合约不参与开仓。具体契约见 [联动接口](https://github.com/hxx344/market-spread-monitor/blob/main/docs/CROSSEX_SIGNALS.md)。
+- Binance / Bybit / OKX 支持 USDT、USDC；Gate 为 USDT；Kraken 为 USD；Lighter 为 USDC。Hyperliquid 普通永续用 USDT 报价、USDC 结算，HYPE / PURR 为 USDC 报价与结算。报价、结算和保证金币种分别保留，不互相替代。
+- USDC / USDT 取 Gate 现货买卖价；USD / USDT 取 Kraken 的 USDT / USD 盘口倒数并反转买卖方向。缺失、倒退、超过 3 分钟的汇率不能用于新模拟，绝不默认兑价为 1。等基础币数量不能对冲结算币汇率风险，本版本没有模拟换汇深度或外汇对冲。
+- Gate / OKX 公开深度的合约张数换算为基础币数量。CrossEx 的订单数量规则已按基础币计量，不重复乘已弃用的 contract_size。官方目录明确为 null 的最小名义额或最大市价数量，会显示“未提供”，不会声称通过该项校验；本地额度、最小数量、步长和深度限制仍执行。
 - 每 5 秒后台读取信号；Gate 合约目录每 5 分钟更新，短暂失败可使用不超过 15 分钟的缓存并显示状态。打开浏览器不是后台运行条件。
 - 自动模拟默认关闭。可手动开平仓，或设置预算、手续费、滑点上限、净价差门槛、止盈止损、最长持有时间后启动自动模拟。
 - 每次开平仓都读取两腿公共盘口，双腿在滑点范围内都能全量模拟成交才记账。该同步模型不等于交易所提供原子双腿订单。
@@ -55,7 +58,7 @@ sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in mar
 
 毛价差 = `(空腿买一 / 多腿卖一 − 1) × 10000 bp`；机会的预算净价差减去四次手续费和四次滑点预算。复核成交深度后，入场均价已经包含逐档滑点，仅另留两次退出滑点预算；不会把已体现在均价里的滑点重复扣费。
 
-模拟净盈亏 = `基础币数量 × (多腿平仓均价 − 多腿开仓均价 + 空腿开仓均价 − 空腿平仓均价) − 四次成交手续费`。手续费按每次实际模拟成交名义额计算。资金费是**未建模**，不是收入为零的已确认事实；页面与摘要均注明未含资金费。持仓浮动值使用平仓方向盘口与预计退出费用，最终平仓重新检查深度。
+每腿先按原始合约价格计算损益：多腿为 `数量 × (平仓价 − 开仓价)`，空腿为 `数量 × (开仓价 − 平仓价)`。再按各腿结算币换算为 USDT，盈利用买价、亏损用卖价；开仓费用按入场汇率保存，平仓费用按退出汇率计算。不会用两次汇率分别换算完整开平仓名义额后相减，避免凭空计入并未持有的外汇资产损益。全 USDT 旧持仓沿用原口径和数据。资金费是**未建模**，不是收入为零的已确认事实；页面与摘要均注明未含资金费。持仓浮动值使用平仓方向盘口与预计退出费用，最终平仓重新检查深度。
 
 收益曲线只使用实际保存的模拟平仓记录，按北京时间展示。最近 200 笔在页面可查，累计指标包含全部记录。
 
@@ -77,4 +80,4 @@ npm start
 
 ## 官方接口依据
 
-2026-09-22 核对：[Gate CrossEx](https://www.gate.com/docs/developers/crossex/zh_CN/) 的 `GET /api/v4/crossex/rule/symbols` 无需认证；模块同时使用 [Binance USDⓈ-M 深度](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Order-Book) 和 [Bybit 线性深度](https://bybit-exchange.github.io/docs/v5/market/orderbook)。服务中没有私有交易所 API 写请求。
+2026-09-22 核对：[Gate CrossEx](https://www.gate.com/docs/developers/crossex/zh_CN/) 的 `GET /api/v4/crossex/rule/symbols` 无需认证；模块同时使用 [Binance USDⓈ-M 深度](https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Order-Book) 和 [Bybit 线性深度](https://bybit-exchange.github.io/docs/v5/market/orderbook)。其余规则及公开接口见 [OKX](https://www.okx.com/docs-v5/en/)、[Kraken Futures](https://docs.kraken.com/api/docs/futures-api/websocket/book/)、[Hyperliquid 合约说明](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/contract-specifications)、[Lighter](https://apidocs.lighter.xyz/docs/websocket-reference)。行情请求包含只读 GET、Hyperliquid info POST，以及 Kraken / Lighter 单次公开 WebSocket 快照；服务中没有私有交易所 API 写请求。

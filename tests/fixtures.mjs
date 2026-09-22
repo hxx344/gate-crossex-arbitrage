@@ -10,9 +10,9 @@ export function feed(at = epoch) { const long = quote('binance', at), short = qu
 export const catalog = ['BINANCE', 'BYBIT'].map(exchange => ({ symbol: `${exchange}_FUTURE_BTC_USDT`, exchange_type: exchange, business_type: 'FUTURE', state: 'live', min_size: '0.001', lot_size: '0.001', tick_size: '0.01', min_notional: '5', max_market_size: '10000', delist_time: '0' }));
 export function book(q, at = epoch) { return { at, bids: [[q.bid, 100]], asks: [[q.ask, 100]] }; }
 export function fixture(t) {
-  const directory = mkdtempSync(join(tmpdir(), 'crossex-test-')); let now = epoch, currentFeed = feed(), depth = q => book(q, now), offline = false;
-  let store = createStore(directory); const options = { clock: () => now, catalogReader: async () => catalog, feedReader: async () => { if (offline) throw new Error('offline'); return currentFeed; }, depthReader: async q => depth(q) };
+  const directory = mkdtempSync(join(tmpdir(), 'crossex-test-')); let now = epoch, currentFeed = feed(), currentCatalog = catalog, depth = q => book(q, now), offline = false;
+  let store = createStore(directory); const options = { clock: () => now, catalogReader: async () => currentCatalog, feedReader: async () => { if (offline) throw new Error('offline'); return currentFeed; }, depthReader: async q => depth(q), fxReader: async () => currentFeed.fx };
   let engine = createEngine(store, options);
   t.after(async () => { await engine.stop(); store.close(); const resolved = join(tmpdir(), ''); if (!directory.startsWith(resolved) || !directory.includes('crossex-test-')) throw new Error('Unsafe test cleanup'); rmSync(directory, { recursive: true, force: true }); });
-  return { directory, get store() { return store; }, get engine() { return engine; }, advance(ms) { now += ms; }, setFeed(value) { currentFeed = value; }, setDepth(fn) { depth = fn; }, offline(value) { offline = value; }, now: () => now, async reopen() { await engine.stop(); store.close(); store = createStore(directory); engine = createEngine(store, options); } };
+  return { directory, get store() { return store; }, get engine() { return engine; }, advance(ms) { now += ms; }, setFeed(value) { currentFeed = value; }, setCatalog(value) { currentCatalog = value; }, setDepth(fn) { depth = fn; }, offline(value) { offline = value; }, now: () => now, async reopen() { await engine.stop(); store.close(); store = createStore(directory); engine = createEngine(store, options); } };
 }

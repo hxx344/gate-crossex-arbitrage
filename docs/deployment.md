@@ -1,6 +1,6 @@
 # 部署、配置与恢复
 
-使用 README 中的一键命令安装或升级。默认只监听 `127.0.0.1:3200`，使用专用系统用户 `gate-crossex-arbitrage`，与原项目端口、配置和数据分离。
+使用 README 中的一键命令安装或升级。七所扩展需要先更新 Monitor（提供 opportunities-v2），再更新 CrossEx；旧版来源会显示明确升级提示。已保存的登录、配置和 USDT 模拟持仓保持不变。默认只监听 `127.0.0.1:3200`，使用专用系统用户 `gate-crossex-arbitrage`，与原项目端口、配置和数据分离。
 
 | 路径 | 用途 |
 | --- | --- |
@@ -14,7 +14,7 @@
 
 环境文件采用无引号 `KEY=value`。支持 `HOST`、`PORT`、`DATA_DIR`、`NODE_ENV` 和可选 `PUBLIC_ORIGIN`。可选 `INITIAL_PASSWORD` 仅首次建库时使用，后续不会覆盖已保存密码。不要在这里填写交易所密钥；此版本不使用它们。
 
-Monitor 登录信息与模拟参数在模块界面保存；用户名、服务地址是配置，密码由服务器 AES-256-GCM 加密，公开状态接口不会返回密码。目录/行情获取全部使用 GET，来源重定向被拒绝。外部盘口目标固定，Monitor 来源只接受回环地址。通常继续复用工作台 SSH 通道即可。直接通过 HTTPS 反向代理访问时须设置 `PUBLIC_ORIGIN=https://实际域名`，并让反向代理保留请求 Host；同时使用工作台代理时，把工作台该项目的“登录来源地址”设置为相同来源。默认 HTTP / SSH 代理部署留空。
+Monitor 登录信息与模拟参数在模块界面保存；用户名、服务地址是配置，密码由服务器 AES-256-GCM 加密，公开状态接口不会返回密码。Monitor 来源读取与目录使用 GET，Hyperliquid 行情使用只读 info POST，Kraken / Lighter 使用单次公开 WebSocket；来源重定向被拒绝。外部盘口目标固定，Monitor 来源只接受回环地址。通常继续复用工作台 SSH 通道即可。直接通过 HTTPS 反向代理访问时须设置 `PUBLIC_ORIGIN=https://实际域名`，并让反向代理保留请求 Host；同时使用工作台代理时，把工作台该项目的“登录来源地址”设置为相同来源。默认 HTTP / SSH 代理部署留空。
 
 配置示例：
 
@@ -47,3 +47,5 @@ sudo -u gate-crossex-arbitrage env DATA_DIR=/var/lib/gate-crossex-arbitrage "$(c
 备份前停止服务，备份整个数据目录和环境文件，再启动服务。必须同时保留 `crossex.sqlite`、可能存在的 WAL 文件与 `credentials.key`。缺失加密密钥时服务会拒绝打开已有数据库。模拟记录不会自动清空；自动模拟启停状态在重启后保留。
 
 `/api/health` 只表示本地服务可运行；Monitor 或交易所连接状态以界面和摘要为准，不能用健康检查成功证明行情或策略可执行。
+
+Kraken 公开盘口需要服务器可连接 `wss://futures.kraken.com/ws/v1`，Lighter 需要 `wss://mainnet.zklighter.elliot.ai/stream`。当前 CrossEx WebSocket 使用直连；连接失败会显示原因并停止相关模拟，不使用本地时间冒充盘口时间。

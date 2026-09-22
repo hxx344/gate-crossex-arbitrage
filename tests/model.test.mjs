@@ -15,7 +15,8 @@ test('per-leg book time, identity and quote currency are enforced independently'
 });
 test('version, mode, heartbeat freshness and quote limits gate signal envelopes', () => {
   assert.equal(validateFeed(feed(), epoch).schemaVersion, 1);
-  for (const extra of [{ mode: 'live' }, { schemaVersion: 2 }, { generatedAt: epoch - 10001 }, { generatedAt: epoch + 5000 }, { status: 'snapshot' }, { quotes: Array(5001).fill({}) }]) assert.throws(() => validateFeed({ ...feed(), ...extra }, epoch));
+  assert.equal(validateFeed({ ...feed(), schemaVersion: 2 }, epoch).schemaVersion, 2);
+  for (const extra of [{ mode: 'live' }, { schemaVersion: 3 }, { generatedAt: epoch - 10001 }, { generatedAt: epoch + 5000 }, { status: 'snapshot' }, { quotes: Array(5001).fill({}) }]) assert.throws(() => validateFeed({ ...feed(), ...extra }, epoch));
 });
 test('signal expiry, direction, venue status and pairing are not trusted', () => {
   const value = feed(); assert.equal(validSignal(value.signals[0], value, epoch), true);
