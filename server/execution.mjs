@@ -15,7 +15,7 @@ export function markedPnl(p, result) {
 }
 
 // Only local simulation receipts are produced here. There is no exchange order transport.
-export function createExecutionRunner(store, { clock, depthReader, fxReader, checkIdentity, calculate }) {
+export function createExecutionRunner(store, { clock, depthReader, fxReader, checkIdentity, checkEntry, calculate }) {
   function create(p, kind, c, reason = '') {
     const at = clock();
     const e = { id: randomUUID(), positionId: p.id, base: p.base, kind, reason, state: 'queued',
@@ -109,8 +109,10 @@ export function createExecutionRunner(store, { clock, depthReader, fxReader, che
     if (complete) { store.transaction(() => finish(e, p)); return; }
     if (e.automatic && !store.config().enabled) return;
     try {
+      if (e.kind === 'open') await checkEntry(p);
       checkIdentity(p);
       const [books, fx] = await Promise.all([Promise.all([p.long, p.short].map(depthReader)), [p.long, p.short].every(q => settlement(q) === 'USDT') ? null : fxReader()]);
+      if (e.kind === 'open') await checkEntry(p);
       checkIdentity(p); validateBooks(books, clock());
       const remaining = leg => e.kind === 'open' ? D(target(p)).minus(qty(p, leg)) : qty(p, leg);
       const leg = remaining('long').gte(remaining('short')) ? 'long' : 'short', i = leg === 'long' ? 0 : 1;

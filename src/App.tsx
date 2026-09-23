@@ -1,5 +1,5 @@
 import { createLatestRead } from './latest-read';
-import { createServerClock, sourceIsStale, valuationStaleReason, STATE_POLL_MS } from './freshness';
+import { createServerClock, sourceIsStale, valuationStaleReason, opportunityStaleReason, STATE_POLL_MS } from './freshness';
 import { useHubBridge, hubChanged, hubNavigate, cleanHubQuery } from './hub-bridge';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowLeftRight, RefreshCw, Play, Pause, Settings, Radio, CheckCircle2, AlertCircle } from 'lucide-react';
@@ -83,7 +83,7 @@ export default function App() {
   const go = (value: Tab) => { setTab(value); location.hash = value; setError(''); };
   const stale = sourceIsStale(state?.source, now, online);
   const stalePositions = state?.positions.filter(p => valuationStaleReason(p.valuation, now, stale)).length || 0;
-  const rows = state?.opportunities.filter(x => (showAll || x.eligible) && (!selectedVenue || [x.long.exchange, x.short.exchange].includes(selectedVenue)) && (!pair.longExchange || x.long.exchange === pair.longExchange) && (!pair.shortExchange || x.short.exchange === pair.shortExchange) && x.base.includes(search.trim().toUpperCase())) || [];
+  const rows = state?.opportunities.filter(x => (showAll || (x.eligible && !opportunityStaleReason(x, now))) && (!selectedVenue || [x.long.exchange, x.short.exchange].includes(selectedVenue)) && (!pair.longExchange || x.long.exchange === pair.longExchange) && (!pair.shortExchange || x.short.exchange === pair.shortExchange) && x.base.includes(search.trim().toUpperCase())) || [];
   const activeExecutions = state?.totals.activeExecutions || 0;
   const enabled = !!state?.config.enabled, entryPaused = !!state?.config.entryPaused;
   const statusText = !enabled ? '全部自动已暂停' : entryPaused ? '新仓已暂停 · 继续退出管理' : stale ? '自动模拟等待行情' : '自动模拟运行中';
@@ -146,7 +146,7 @@ export default function App() {
           </section>
           {tab === 'opportunities' && <section className="panel">
             <div className="section-heading">
-              <div><h2>同币种，跨所价差</h2><p>七所永续 · 统一折算 USDT · {state.opportunities.filter(x => x.eligible).length} 个候选通过初筛</p></div>
+              <div><h2>同币种，跨所价差</h2><p>七所永续 · 统一折算 USDT · {state.opportunities.filter(x => x.eligible && !opportunityStaleReason(x, now)).length} 个候选通过初筛</p></div>
               <div className="filters">
                 {(pair.longExchange || pair.shortExchange) && <button onClick={() => { setPair({}); const url = new URL(location.href); url.searchParams.delete('longExchange'); url.searchParams.delete('shortExchange'); history.replaceState(null, '', url); }}>清除方向限定</button>}
                 <select aria-label="筛选交易所" value={selectedVenue} onChange={e => setSelectedVenue(e.target.value)}><option value="">全部交易所</option>{Object.entries(venues).map(([id, name]) => <option value={id} key={id}>{name}</option>)}</select>
@@ -155,13 +155,14 @@ export default function App() {
               </div>
             </div>
             {entryPaused && <div className="inline-state warning" role="status">新仓已暂停；允许新仓后可继续手动或自动开仓，已有持仓仍按当前自动开关管理。</div>}
+            <div className="inline-state" role="status">{state.source.entryPolicy?.requireSpotTransfer === true ? 'Monitor 已开启：双边有可交易现货、共同网络双向充提正常' : state.source.entryPolicy?.requireSpotTransfer === false ? 'Monitor 现货与充提筛选未启用，当前机会不代表已核验充提' : 'Monitor 未提供现货与充提策略，资格未核验'}{state.source.entryPolicy && ` · 本次排除 ${state.source.entryPolicy.excluded} 个组合 · 屏蔽 ${state.source.entryPolicy.blockedBases.length} 个币种`}</div>
             <div className="table-wrap"><table>
               <thead><tr><th>币种 / 方向</th><th>多腿卖一 / 空腿买一</th><th>折算毛价差</th><th>预算净价差</th><th>检查结果</th><th>操作</th></tr></thead>
-              <tbody>{rows.slice(0, 100).map(row => <OpportunityRow key={row.pairKey} row={row} staged={state.config.executionMode === 'staged'} disabled={busy || stale || entryPaused}
+              <tbody>{rows.slice(0, 100).map(row => <OpportunityRow key={row.pairKey} row={row} now={now} staged={state.config.executionMode === 'staged'} disabled={busy || stale || entryPaused}
                 monitor={hub.connected ? () => hubNavigate('monitor', { symbol: row.base, longExchange: row.long.exchange, shortExchange: row.short.exchange }) : undefined}
                 open={() => void mutate('/api/open', { signalId: row.id }, 'POST', 'open:' + row.id)}/>)}</tbody>
             </table></div>
-            {!rows.length && <div className="empty"><ArrowLeftRight size={28}/><h3>{stale ? '等待价差模块的实时信号' : '暂时没有达到阈值的机会'}</h3><p>{stale ? '在连接与设置中填写同机价差服务的登录信息。' : '可显示未通过机会查看原因，或在设置里调整模拟参数。'}</p></div>}
+            {!rows.length && <div className="empty"><ArrowLeftRight size={28}/><h3>{stale ? '等待价差模块的实时信号' : state.source.entryPolicy?.requireSpotTransfer ? '现货与充提筛选后暂无符合条件的机会' : '暂时没有达到阈值的机会'}</h3><p>{stale ? '在连接与设置中填写同机价差服务的登录信息。' : state.source.entryPolicy?.requireSpotTransfer ? '新机会须通过双边现货、共同网络与充提核验；已有持仓可继续管理。' : '可显示未通过机会查看原因，或在设置里调整模拟参数。'}</p></div>}
             <div className="footnote">盘口价格保留原计价币；价差按双边汇率折算 USDT。预算净价差扣除多空双腿开仓与退出四次费率及四次滑点预算，资金费单独核算。当前为{state.config.executionMode === 'staged' ? '分阶段模拟，开仓后在“模拟持仓”跟踪订单与修复' : '双腿原子模拟，全量可成交后才记账'}。</div>
           </section>}
           {tab === 'positions' && <PositionsPanel state={state} now={now} stale={stale} online={online} busy={busy}
@@ -180,13 +181,15 @@ function Metric({ label, value, unit, detail, signed }: { label: string; value: 
   return <div className="metric"><span>{label}</span><div className={value === '—' ? '' : signedClass(signed)}><strong>{value}</strong><small>{unit}</small></div><p>{detail}</p></div>;
 }
 
-function OpportunityRow({ row, disabled, staged, open, monitor }: { row: Opportunity; disabled: boolean; staged: boolean; open: () => void; monitor?: () => void }) {
+function OpportunityRow({ row, now, disabled, staged, open, monitor }: { row: Opportunity; now: number; disabled: boolean; staged: boolean; open: () => void; monitor?: () => void }) {
+  const expiryReason = opportunityStaleReason(row, now);
+  const eligible = row.eligible && !expiryReason;
   return <tr>
     <td><strong>{row.base}</strong><small>{direction(row)}</small></td>
     <td>{format(row.long.ask, 6)} {row.long.quoteCurrency}<small>{format(row.short.bid, 6)} {row.short.quoteCurrency}</small></td>
     <td>{format(row.grossBps)} bp</td>
     <td className={signedClass(row.netBps)}>{format(row.netBps)} bp{row.feeSnapshot && <small>往返费率 {format(row.feeSnapshot.long.entry.bps + row.feeSnapshot.long.exit.bps + row.feeSnapshot.short.entry.bps + row.feeSnapshot.short.exit.bps)} bp</small>}</td>
-    <td><span className={row.eligible ? 'positive' : 'muted'}>{row.eligible ? '待深度复核' : row.reason}</span>{!!row.warnings?.length && <small className="rule-note">部分目录额度未提供，仅按模拟预算复核</small>}</td>
-    <td><div className="row-actions"><button className="primary" disabled={disabled || !row.eligible} onClick={open}>{staged ? '分阶段开仓' : '模拟开仓'}</button>{monitor && <button onClick={monitor}>在 Monitor 查看</button>}</div></td>
+    <td><span className={eligible ? 'positive' : 'muted'}>{expiryReason || (row.eligible ? '待深度复核' : row.reason)}</span><small>{row.transfer?.reason || '现货与充提未核验'}</small>{row.transfer?.state === 'verified' && <><small>共同网络 {row.transfer.networks.join(' / ')} · 双向充提</small><small>核验 {time(row.transfer.checkedAt)} · 到期 {time(row.transfer.expiresAt)}</small></>}{!!row.warnings?.length && <small className="rule-note">部分目录额度未提供，仅按模拟预算复核</small>}</td>
+    <td><div className="row-actions"><button className="primary" disabled={disabled || !eligible} onClick={open}>{staged ? '分阶段开仓' : '模拟开仓'}</button>{monitor && <button onClick={monitor}>在 Monitor 查看</button>}</div></td>
   </tr>;
 }

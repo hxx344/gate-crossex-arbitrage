@@ -15,10 +15,12 @@ export type Config = {
 };
 export type FeeRate = { bps: number; source: string; updatedAt: number | null };
 export type FeeSnapshot = { long: { entry: FeeRate; exit: FeeRate }; short: { entry: FeeRate; exit: FeeRate } };
+export type TransferEligibility = { state: 'verified' | 'blocked' | 'disabled' | 'unverified'; reason: string; networks: string[]; checkedAt: number | null; expiresAt: number | null };
 export type Opportunity = {
   id: string; pairKey: string; base: string; long: Quote; short: Quote; grossBps: number | null;
   netBps: number | null; eligible: boolean; reason: string; observedAt: number; warnings?: string[];
   feeSnapshot?: FeeSnapshot;
+  expiresAt: number; transfer: TransferEligibility;
 };
 export type Valuation = {
   at: number | null; stale: boolean; net: number | null; netWithFunding?: number | null;
@@ -72,7 +74,7 @@ export type State = {
   now: number; csrfToken: string; venues: { id: string; state: string; quoteCount: number }[];
   fx: { currency: string; state: string; bid?: number; ask?: number; at?: number; error?: string }[];
   config: Config;
-  source: { state: string; error: string | null; updatedAt: number | null; checkedAt: number | null; generatedAt?: number | null; receivedAt?: number | null; durationMs?: number | null; quoteCount: number };
+  source: { state: string; error: string | null; updatedAt: number | null; checkedAt: number | null; generatedAt?: number | null; receivedAt?: number | null; durationMs?: number | null; quoteCount: number; entryPolicy?: { requireSpotTransfer: boolean; blockedBases: string[]; excluded: number; revision?: number } | null };
   catalog: { state: string; count: number; updatedAt: number | null; error: string | null };
   totals: {
     openCount: number; closedCount: number; usedNotional: number; realizedPnl: number;

@@ -2,7 +2,7 @@ import { randomUUID, createHash } from 'node:crypto';
 import { AppError, configuration, validateFeed, validSignal, pairKey, quoteKey, contractIdentity, freshQuote, quoteTime, catalogRule, commonQuantity, validateBooks, fill, partialFill, pnl, fxRate, referencePrice, notionalUSDT, storedNotional, settlement, SUPPORTED_VENUES } from './model.mjs';
 import { loadCatalog, loadFeed, loadDepth, loadFx } from './clients.mjs';
 import { D } from './money.mjs';
-import { commonQuantityExact } from './model.mjs';
+import { commonQuantityExact, transferEligibility } from './model.mjs';
 import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
 import { createExecutionRunner, markedPnl } from './execution.mjs';
 import { loadFunding } from './funding-client.mjs';
@@ -15,11 +15,12 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
   let sourceReceivedAt = null, sourceDurationMs = null;
   let catalog = store.get('catalog', { at: 0, items: [] }), catalogAttempt = 0, chain = Promise.resolve(), closing = false;
   let sourceFlight = null, sourceGeneration = 0;
+  let entryPolicyKnown = store.get('entryPolicyKnown', false);
   const recentSignals = new Map();
   let indexedFeed = null, quoteIndex = new Map(), venueCounts = new Map(), cachedHistory = null;
   const historyEpoch = randomUUID();
   const calculate = (p, long, short, fx, at = clock()) => markedPnl(p, pnl(p, long, short, fx, at));
-  const execution = createExecutionRunner(store, { clock, depthReader, fxReader, checkIdentity: checkPositionIdentity, calculate });
+  const execution = createExecutionRunner(store, { clock, depthReader, fxReader, checkIdentity: checkPositionIdentity, checkEntry, calculate });
   let accountingFlight = null, depthFlight = null;
   const fundingAttempts = new Map();
   const quantity = (p, leg) => p[`${leg}Quantity`] ?? p.quantity;
@@ -71,6 +72,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
       const next = await feedReader(config(), store.decrypt(store.get('monitorPassword')));
       if (closing || generation !== sourceGeneration) return;
       feed = validateFeed(next, clock()); sourceError = null; sourceReceivedAt = clock();
+      if (feed.crossexFilter !== undefined && !entryPolicyKnown) { entryPolicyKnown = true; store.set('entryPolicyKnown', true); }
       for (const [id, signal] of recentSignals) if (!Number.isFinite(signal.expiresAt) || signal.expiresAt < clock()) recentSignals.delete(id);
       for (const signal of feed.signals) if (validSignal(signal, feed, clock())) recentSignals.set(signal.id, signal);
       while (recentSignals.size > 800) recentSignals.delete(recentSignals.keys().next().value);
@@ -86,20 +88,46 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     return sourceFlight;
   }
   function sourceLive() { return !sourceError && feed && clock() - feed.generatedAt <= 10000 && feed.generatedAt <= clock() + 1000; }
+  function entryEligibility(signal, original = true) {
+    let transfer = transferEligibility(signal, feed, clock());
+    if (entryPolicyKnown && feed?.crossexFilter === undefined) transfer = { ...transfer, state: 'blocked', reason: 'Monitor 筛选策略缺失，等待恢复；不能沿用旧资格' };
+    if (!sourceLive()) return { transfer, reason: sourceError || '价差信号已经过期' };
+    if (transfer.state === 'blocked' && original) return { transfer, reason: transfer.reason };
+    const latest = feed.signals.find(current => current.pairKey === pairKey(signal)
+      && contractIdentity(current.long) === contractIdentity(signal.long) && contractIdentity(current.short) === contractIdentity(signal.short));
+    if (!latest) return { transfer, reason: 'Monitor 已撤回或不再列出此方向的机会，请等待新机会' };
+    transfer = transferEligibility(latest, feed, clock());
+    if (entryPolicyKnown && feed.crossexFilter === undefined) return { transfer: { ...transfer, state: 'blocked' }, reason: 'Monitor 筛选策略缺失，等待恢复；不能沿用旧资格' };
+    if (transfer.state === 'blocked') return { transfer, reason: transfer.reason };
+    if (!validSignal(latest, feed, clock()) || (original && !validSignal(signal, feed, clock()))) return { transfer, reason: '报价过期、身份不明、下架或双腿不同步' };
+    return { transfer, reason: '', latest };
+  }
+  // Staged execution authorizes each new receipt with the current pair, not the
+  // ten-second signal used when the task was created. Reconciliation/exit bypass it.
+  async function checkEntry(p) {
+    await refreshSource();
+    if (config().entryPaused) throw new AppError('新仓已暂停，停止新增开仓分片');
+    const eligibility = entryEligibility(p, false);
+    if (eligibility.reason) throw new AppError(eligibility.reason);
+    if (!catalogAvailable()) throw new AppError('CrossEx 合约目录已过期，停止新增开仓分片');
+    for (const q of [p.long, p.short]) catalogRule(q, catalog.items);
+    p.entryTransfer = eligibility.transfer;
+    p.entryFilter = feed.crossexFilter ?? null;
+  }
   function candidates(signals = feed?.signals || []) {
     if (!feed) return [];
     const c = config();
     return signals.slice(0, 200).map(signal => {
       let grossBps = NaN, reason = '', warnings = [];
+      const eligibility = entryEligibility(signal);
       try { grossBps = (referencePrice(signal.short, signal.short.bid, 'sell', feed.fx, clock()) / referencePrice(signal.long, signal.long.ask, 'buy', feed.fx, clock()) - 1) * 10000; for (const q of [signal.long, signal.short]) fxRate(settlement(q), feed.fx, clock()); } catch (error) { reason = safeMessage(error); }
       const fees = feeSnapshot(c, signal.long, signal.short), netBps = grossBps - roundTripFeeBps(fees) - 4 * c.slippageBps;
-      if (!sourceLive()) reason = sourceError || '价差信号已经过期';
-      else if (!reason && !validSignal(signal, feed, clock())) reason = '报价过期、身份不明、下架或双腿不同步';
+      if (eligibility.reason) reason = eligibility.reason;
       else if (!catalogAvailable()) reason = '等待有效的 CrossEx 合约目录';
       else if (!reason) { try { warnings = [catalogRule(signal.long, catalog.items), catalogRule(signal.short, catalog.items)].flatMap(rule => rule.unverifiedConstraints); } catch (error) { reason = safeMessage(error); } }
       if (!reason && netBps < c.minNetBps) reason = '扣除往返费用与滑点预算后未达开仓阈值';
-      return { ...signal, grossBps: Number.isFinite(grossBps) ? grossBps : null, netBps: Number.isFinite(netBps) ? netBps : null, feeSnapshot: fees, eligible: !reason, reason, warnings };
-    }).sort((a, b) => (b.netBps ?? -Infinity) - (a.netBps ?? -Infinity));
+      return { ...signal, transfer: eligibility.transfer, grossBps: Number.isFinite(grossBps) ? grossBps : null, netBps: Number.isFinite(netBps) ? netBps : null, feeSnapshot: fees, eligible: !reason, reason, warnings };
+    }).sort((a, b) => Number(b.eligible) - Number(a.eligible) || (b.netBps ?? -Infinity) - (a.netBps ?? -Infinity) || a.pairKey.localeCompare(b.pairKey));
   }
   function valuation(p) {
     if (p.status === 'closed') return { at: p.closedAt, stale: false, ...p.result };
@@ -144,7 +172,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     const hasFreshSource = (feed?.quotes || []).some(q => freshQuote(q, clock()) && feed.exchanges.some(x => x.id === q.exchange && x.status === 'live'));
     const venues = SUPPORTED_VENUES.map(id => { const upstream = feed?.exchanges.find(x => x.id === id); return { id, state: sourceLive() ? upstream?.status ?? 'unavailable' : 'offline', quoteCount: venueCounts.get(id) || 0 }; });
     const fx = ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (error) { return { currency, state: 'unavailable', error: safeMessage(error) }; } });
-    return { mode: 'paper', liveTradingAvailable: false, now: clock(), venues, fx, config: publicConfig, executions: store.executions().map(publicExecution), source: { state: sourceLive() && hasFreshSource ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError, checkedAt: sourceCheckedAt, receivedAt: sourceReceivedAt, durationMs: sourceDurationMs, generatedAt: feed?.generatedAt ?? null, updatedAt: sourceTimes.length ? Math.max(...sourceTimes) : null, quoteCount: feed?.quotes.length || 0 }, catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError }, totals: totals(positions), opportunities: candidates(), positions: positions.filter(p => p.status === 'open').map(p => ({ ...publicPosition(p), exitQuote: p.exitQuote ? { ...p.exitQuote, stale: p.exitQuote.stale || clock() - p.exitQuote.sourceAt > 10000 } : undefined, valuation: valuation(p) })), ...(includeHistory ? historyView(historyVersion) : {}) };
+    return { mode: 'paper', liveTradingAvailable: false, now: clock(), venues, fx, config: publicConfig, executions: store.executions().map(publicExecution), source: { state: sourceLive() && hasFreshSource ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError, checkedAt: sourceCheckedAt, receivedAt: sourceReceivedAt, durationMs: sourceDurationMs, generatedAt: feed?.generatedAt ?? null, updatedAt: sourceTimes.length ? Math.max(...sourceTimes) : null, quoteCount: feed?.quotes.length || 0, entryPolicy: feed?.crossexFilter && typeof feed.crossexFilter.requireSpotTransfer === 'boolean' && Array.isArray(feed.crossexFilter.blockedBases) ? { requireSpotTransfer: feed.crossexFilter.requireSpotTransfer, blockedBases: feed.crossexFilter.blockedBases.filter(base => typeof base === 'string'), excluded: Number.isSafeInteger(feed.crossexFilter.excluded) ? feed.crossexFilter.excluded : 0, revision: feed.crossexFilter.revision } : null }, catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError }, totals: totals(positions), opportunities: candidates(), positions: positions.filter(p => p.status === 'open').map(p => ({ ...publicPosition(p), exitQuote: p.exitQuote ? { ...p.exitQuote, stale: p.exitQuote.stale || clock() - p.exitQuote.sourceAt > 10000 } : undefined, valuation: valuation(p) })), ...(includeHistory ? historyView(historyVersion) : {}) };
   }
   // Read only the open positions and aggregate totals; no candidate ranking or history payload.
   function summary() {
@@ -195,6 +223,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
   const saveResult = (id, fingerprint, result) => store.db.prepare('INSERT INTO requests VALUES (?,?,?)').run(id, fingerprint, JSON.stringify(result));
   async function open(signalId, requestId) {
     const fingerprint = `open:${signalId}`, previous = requestResult(requestId, fingerprint); if (previous) return previous;
+    await refreshSource();
     const c = config(), remembered = recentSignals.get(signalId);
     if (c.entryPaused) throw new AppError('新仓已暂停，已有持仓仍可管理');
     // A browser and the collector need not poll in phase. Keep the exact server-seen
@@ -210,7 +239,9 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     const rules = [catalogRule(candidate.long, catalog.items), catalogRule(candidate.short, catalog.items)];
     const legs = [candidate.long, candidate.short];
     const [books, fx] = await Promise.all([Promise.all(legs.map(q => depthReader(q))), legs.every(q => q.quoteCurrency === 'USDT' && settlement(q) === 'USDT') ? null : fxReader()]);
-    if (!sourceLive() || !validSignal(candidate, feed, clock()) || !catalogAvailable()) throw new AppError('深度检查期间信号过期，请等待新机会');
+    await refreshSource();
+    const eligibility = entryEligibility(candidate);
+    if (eligibility.reason || !catalogAvailable()) throw new AppError(`深度检查期间信号过期或资格变化：${eligibility.reason || 'CrossEx 合约目录已过期'}`);
     validateBooks(books, clock());
     const prices = [books[0].asks[0][0], books[1].bids[0][0]];
     const quantity = commonQuantityExact(c.notionalPerLeg, prices, rules, legs.map((q, i) => notionalUSDT(q, prices[i], fx, clock())));
@@ -225,6 +256,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (D(total.usedNotional).plus(total.reservedNotional).plus(reservation).gt(c.maxTotalNotional)) throw new AppError('已达到双腿总名义额上限');
     const entryFees = D(longFill.notionalUSDT).mul(fees.long.entry.bps).plus(D(shortFill.notionalUSDT).mul(fees.short.entry.bps)).div(10000);
     const p = { accountingVersion: 3, id: randomUUID(), signalId, pairKey: pairKey(candidate), base: candidate.base, status: 'open', openedAt: clock(), quantity: Number(quantity), quantityExact: quantity, longQuantity: String(quantity), shortQuantity: String(quantity), long: candidate.long, short: candidate.short, crossexSymbols: rules.map(x => x.symbol), executionRules: rules, unverifiedConstraints: rules.flatMap(r => r.unverifiedConstraints), longFill, shortFill, entryFx: fx, depthAt: books.map(x => x.at), feeBps: c.feeBps, feeSnapshot: fees, slippageBps: c.slippageBps, takeProfitBps: c.takeProfitBps, stopLossBps: c.stopLossBps, maxHoldMinutes: c.maxHoldMinutes, entryFees: entryFees.toNumber(), entryFeesExact: entryFees.toString(), entryGrossBps, fundingPnl: null };
+    p.entryTransfer = eligibility.transfer; p.entryFilter = feed.crossexFilter ?? null;
     if (staged) { p.longQuantity = p.shortQuantity = '0'; p.longFill = { quantity: 0, price: null, notional: 0, notionalUSDT: 0 }; p.shortFill = { ...p.longFill }; p.entryFees = 0; p.entryFeesExact = '0'; }
     p.quantityHistory = [{ at: p.openedAt, longQuantity: p.longQuantity, shortQuantity: p.shortQuantity, fx }];
     p.funding = fundingLedger(p, {}, clock());
@@ -366,7 +398,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (input.clearMonitorPassword !== undefined && typeof input.clearMonitorPassword !== 'boolean') throw new AppError('清除密码选项无效');
     const changed = previous.monitorUrl !== next.monitorUrl || previous.monitorUsername !== next.monitorUsername;
     store.transaction(() => { store.set('config', next); if (changed || input.clearMonitorPassword) store.set('monitorPassword', null); if (input.monitorPassword) store.set('monitorPassword', store.encrypt(input.monitorPassword)); store.event(clock(), next.enabled ? '已开启自动模拟；配置已保存' : '自动模拟已暂停；配置已保存'); });
-    if (changed || input.clearMonitorPassword || input.monitorPassword) { sourceGeneration++; feed = null; recentSignals.clear(); sourceCheckedAt = null; sourceReceivedAt = null; sourceDurationMs = null; sourceError = '连接设置已更改，等待重新读取'; }
+    if (changed || input.clearMonitorPassword || input.monitorPassword) { sourceGeneration++; feed = null; recentSignals.clear(); entryPolicyKnown = false; store.set('entryPolicyKnown', false); sourceCheckedAt = null; sourceReceivedAt = null; sourceDurationMs = null; sourceError = '连接设置已更改，等待重新读取'; }
     return view();
   }
   return { view, summary, refreshSource, refreshAccounting, refreshValuations, tick: options => serial(() => tick(options)), open: (s, r) => serial(() => open(s, r)), closePosition: (id, r) => serial(() => closePosition(id, r)), executionAction: (id, action, r) => serial(() => executionAction(id, action, r)), settings: input => serial(() => settings(input)), async stop() { closing = true; await Promise.all([chain, sourceFlight, accountingFlight, depthFlight]); } };

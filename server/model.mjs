@@ -75,9 +75,28 @@ export function freshQuote(q, now) {
   const at = quoteTime(q);
   return validIdentity(q) && positive(q.bid) && positive(q.ask) && q.bid <= q.ask && Number.isFinite(at) && at > 0 && at <= now + 1000 && now - at <= 10000;
 }
+// Monitor owns spot/network collection and address matching. Its certificate is
+// bounded evidence, not a timeless boolean or a replacement for BBO checks.
+export function transferEligibility(signal, feed, now) {
+  const policy = feed?.crossexFilter;
+  const blocked = reason => ({ state: 'blocked', reason, networks: [], checkedAt: null, expiresAt: null });
+  if (policy !== undefined && (!policy || typeof policy.requireSpotTransfer !== 'boolean' || !Array.isArray(policy.blockedBases)
+    || policy.blockedBases.length > 200 || policy.blockedBases.some(base => typeof base !== 'string' || !/^[A-Z0-9][A-Z0-9._-]{0,39}$/.test(base))
+    || (policy.revision !== undefined && (!Number.isSafeInteger(policy.revision) || policy.revision < 0)))) return blocked('Monitor 新仓筛选策略无效，等待重新核验');
+  if (policy?.blockedBases.includes(signal?.base)) return blocked('该币种已被 Monitor 屏蔽，停止新仓');
+  const evidence = signal?.spotTransfer;
+  if (evidence === undefined && !policy?.requireSpotTransfer) return { state: policy ? 'disabled' : 'unverified', reason: policy ? '现货与充提筛选未启用' : '来源未提供现货与充提策略', networks: [], checkedAt: null, expiresAt: null };
+  if (!evidence || !Array.isArray(evidence.networks) || !evidence.networks.length || evidence.networks.length > 100
+    || evidence.networks.some(network => typeof network !== 'string' || !/^[A-Z0-9_]{1,40}$/.test(network))
+    || new Set(evidence.networks).size !== evidence.networks.length
+    || !Number.isFinite(evidence.checkedAt) || evidence.checkedAt <= 0 || evidence.checkedAt > now
+    || !Number.isFinite(evidence.expiresAt) || evidence.expiresAt <= evidence.checkedAt || evidence.expiresAt > evidence.checkedAt + 180000
+    || now >= evidence.expiresAt || signal.expiresAt > evidence.expiresAt) return blocked('双边现货、共同网络或双向充提证据缺失、无效或已过期');
+  return { state: 'verified', reason: '双边现货可交易，共同网络双向充提正常', networks: [...evidence.networks], checkedAt: evidence.checkedAt, expiresAt: evidence.expiresAt };
+}
 export function validSignal(s, feed, now) {
   if (!s || typeof s.id !== 'string' || s.id.length > 150 || !s.id || s.base !== s.long?.base || s.base !== s.short?.base || s.quoteCurrency !== 'USDT' || s.long?.exchange === s.short?.exchange || !freshQuote(s.long, now) || !freshQuote(s.short, now) || s.pairKey !== pairKey(s)) return false;
-  if (Math.abs(quoteTime(s.long) - quoteTime(s.short)) > 5000 || !Number.isFinite(s.expiresAt) || s.expiresAt < now || s.expiresAt > Math.min(quoteTime(s.long), quoteTime(s.short)) + 10000) return false;
+  if (Math.abs(quoteTime(s.long) - quoteTime(s.short)) > 5000 || !Number.isFinite(s.expiresAt) || s.expiresAt <= now || s.expiresAt > Math.min(quoteTime(s.long), quoteTime(s.short)) + 10000 || transferEligibility(s, feed, now).state === 'blocked') return false;
   try { for (const q of [s.long, s.short]) { fxRate(q.quoteCurrency, feed.fx, now); fxRate(settlement(q), feed.fx, now); } } catch { return false; }
   return [s.long, s.short].every(q => !q.delisting && !q.delistingAt && feed.exchanges.some(x => x.id === q.exchange && x.status === 'live') && feed.quotes.some(current => quoteKey(current) === quoteKey(q) && contractIdentity(current) === contractIdentity(q) && freshQuote(current, now) && !current.delisting && !current.delistingAt));
 }
