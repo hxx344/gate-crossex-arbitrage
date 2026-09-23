@@ -18,7 +18,8 @@ export function analyticsView(store, config) {
   const samples = store.samples('equity');
   const positions = store.db.prepare("SELECT id,json_extract(json,'$.base') AS base,json_extract(json,'$.entryGrossBps') AS entry FROM positions ORDER BY opened_at DESC LIMIT 50").all().map(p => {
     const rows = store.samples(p.id), spreads = rows.map(x => x.spreadBps).filter(Number.isFinite);
-    return { positionId: p.id, base: p.base, maxExitSpreadBps: spreads.length ? Math.max(...spreads) : null, maxAdverseSpreadBps: spreads.length && Number.isFinite(p.entry) ? Math.max(0, Math.max(...spreads) - p.entry) : null, samples: compact(rows, ['spreadBps', 'net']) };
+    const maxExitSpreadBps = spreads.length ? Math.max(...spreads) : null;
+    return { positionId: p.id, base: p.base, maxExitSpreadBps, maxAdverseSpreadBps: maxExitSpreadBps !== null && Number.isFinite(p.entry) ? Math.max(0, maxExitSpreadBps - p.entry) : null, samples: compact(rows, ['spreadBps', 'net']) };
   });
   return { samples: compact(samples, ['equity', 'priceOnlyEquity', 'drawdown']), maxDrawdown: store.get('maxDrawdown', null), latestAt: samples.at(-1)?.at ?? null, retainedFrom: samples[0]?.at ?? null, sampleSeconds: config.historySampleSeconds, positions };
 }
