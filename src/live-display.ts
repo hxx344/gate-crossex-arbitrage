@@ -7,6 +7,35 @@ export function exact(value: string | null | undefined): string {
   try { return new Decimal(value).isFinite() ? new Decimal(value).toFixed() : '—'; } catch { return '—'; }
 }
 
+export type DecimalKind = 'price' | 'quantity' | 'amount' | 'rate';
+const displayPrecision: Record<DecimalKind, { places: number; significant: number }> = {
+  price: { places: 8, significant: 10 }, quantity: { places: 8, significant: 10 },
+  amount: { places: 4, significant: 10 }, rate: { places: 4, significant: 8 },
+};
+
+/** Display only: never use the rounded result for arithmetic, inputs or requests. */
+export function formatDecimal(value: string | null | undefined, kind: DecimalKind = 'quantity'): string {
+  if (value == null || !value.trim()) return '—';
+  try {
+    const number = new ExactDecimal(value);
+    if (!number.isFinite()) return '—';
+    if (number.isZero()) return '0';
+    const { places, significant } = displayPrecision[kind];
+    // Tiny fees and residual exposure must remain visible instead of rounding to zero.
+    const rounded = number.abs().lt(new ExactDecimal(10).pow(-places))
+      ? number.toSignificantDigits(4, Decimal.ROUND_HALF_UP)
+      : number.toDecimalPlaces(places, Decimal.ROUND_HALF_UP).toSignificantDigits(significant, Decimal.ROUND_HALF_UP);
+    if (rounded.abs().lt('0.00000001') || rounded.abs().gte('10000000000')) return rounded.toSignificantDigits(6).toExponential();
+    const fixed = rounded.toFixed();
+    return fixed.replace('-', '').length > 14 ? rounded.toSignificantDigits(6).toExponential() : fixed;
+  } catch { return '—'; }
+}
+
+export function formatSigned(value: string | null | undefined, kind: DecimalKind = 'quantity'): string {
+  const formatted = formatDecimal(value, kind);
+  return formatted !== '—' && new ExactDecimal(value!).gt(0) ? '+' + formatted : formatted;
+}
+
 export function signedAmount(value: string | null | undefined): string {
   const result = exact(value);
   if (result === '—') return result;

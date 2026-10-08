@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
-import { exact, signedAmount, netBaseQuantity, positiveQuantity, stateIsUncertain, sideLabel, liquidationPrice } from '../src/live-display.ts';
+import { exact, formatDecimal, formatSigned, signedAmount, netBaseQuantity, positiveQuantity, stateIsUncertain, sideLabel, liquidationPrice } from '../src/live-display.ts';
 import { readPendingRequest, writePendingRequest, requestStorageKey, readRequestStatus, resolveRequestStatus } from '../src/live-requests.ts';
 const sourceResolution = registerHooks({ resolve(specifier, context, nextResolve) {
   return nextResolve(context.parentURL?.endsWith('/src/position-view.ts') && specifier === './live-display' ? './live-display.ts' : specifier, context);
 } });
-const { fractionQuantity, groupPositions, instrumentFees, sumNative, weightedPrice } = await import('../src/position-view.ts');
+const { fractionQuantity, groupPositions, instrumentFees, sumNative, weightedPrice, percentage } = await import('../src/position-view.ts');
 sourceResolution.deregister();
 
 test('exchange decimal amounts retain digits beyond JavaScript numeric precision', () => {
@@ -15,6 +15,42 @@ test('exchange decimal amounts retain digits beyond JavaScript numeric precision
   assert.equal(exact(null), '—');
   assert.equal(exact(''), '—');
   assert.equal(exact('not-a-number'), '—');
+});
+
+test('compact decimal display removes binary tails without changing original amounts', () => {
+  const quantity = '0.0075000000000000001', cumulative = '1.2501000000000004';
+  assert.equal(formatDecimal(quantity), '0.0075');
+  assert.equal(formatDecimal(cumulative), '1.2501');
+  assert.equal(formatDecimal('80688.00000000001', 'price'), '80688');
+  assert.equal(formatDecimal('80688.125', 'price'), '80688.125');
+  assert.equal(formatDecimal('9876.5432198765', 'amount'), '9876.5432');
+  assert.equal(exact(quantity), quantity);
+  assert.equal(exact(cumulative), cumulative);
+});
+
+test('tiny prices, fees and signed residuals remain nonzero and bounded', () => {
+  assert.equal(formatDecimal('0.00000001', 'price'), '0.00000001');
+  assert.equal(formatDecimal('0.000000000123456789', 'price'), '1.235e-10');
+  assert.equal(formatDecimal('0.000012345678', 'amount'), '0.00001235');
+  assert.equal(formatSigned('-0.0000000000000000001', 'amount'), '-1e-19');
+  assert.equal(formatSigned('0.0000000000000000001'), '+1e-19');
+  assert.equal(formatDecimal('9007199254740993.1234567890123456789'), '9.0072e+15');
+  for (const value of ['-0', '-0.000', '0', '0.000']) {
+    assert.equal(formatDecimal(value), '0'); assert.equal(formatSigned(value), '0');
+  }
+  for (const value of [null, undefined, '', ' ', 'NaN', 'Infinity', 'not-a-number']) assert.equal(formatDecimal(value), '—');
+});
+
+test('display bounds handle scientific notation without rounding rates to zero', () => {
+  for (const kind of ['price', 'quantity', 'amount', 'rate']) for (const value of ['1e-100', '-1e100', '0.0000001234567890123', '9999999999.999999999999']) {
+    const text = formatDecimal(value, kind);
+    assert.notEqual(text, '0'); assert.ok(text.length <= 16, `${kind}: ${text}`);
+  }
+  assert.equal(percentage('0.0000000591'), '0.00000591%');
+  assert.equal(percentage('-0.00001'), '-0.001%');
+  assert.equal(percentage('0.0123456789'), '1.2346%');
+  assert.equal(percentage(null), '—');
+  assert.equal(percentage('-0'), '0%');
 });
 
 test('net exposure uses native LONG/SHORT and preserves exact residuals', () => {

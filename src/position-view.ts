@@ -1,6 +1,6 @@
 import Decimal from 'decimal.js';
 import type { LivePosition } from './live-types';
-import { exact, netBaseQuantity } from './live-display';
+import { exact, formatDecimal, netBaseQuantity } from './live-display';
 const D = Decimal.clone({ precision: 100 });
 
 export function fractionQuantity(quantity: string | null, percent: number, step?: string | null): string | null {
@@ -51,7 +51,7 @@ export function decimalField(row: Record<string, unknown> | null | undefined, ..
   for (const field of fields) { const value = row?.[field]; if (typeof value === 'string' && exact(value) !== '—') return value; }
   return null;
 }
-export function percentage(value: string | null | undefined): string { return exact(value) === '—' ? '—' : new D(value!).mul(100).toSignificantDigits(8).toFixed() + '%'; }
+export function percentage(value: string | null | undefined): string { return exact(value) === '—' ? '—' : formatDecimal(new D(value!).mul(100).toFixed(), 'rate') + '%'; }
 
 export function instrumentFees(fees: Record<string, unknown>[] | undefined, symbol: string | undefined) {
   const row = fees?.find(item => item.exchange_type === symbol?.split('_')[0]);

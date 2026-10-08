@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createPublicClients } from '../server/clients.mjs';
 import { publicSnapshot } from '../server/public-snapshot.mjs';
+import { D } from '../server/money.mjs';
 
 const NOW = 1790067200000;
 function quote(exchange, currency = 'USDT', base = 'BTC') {
@@ -61,6 +62,48 @@ for (const [exchange, currency, expectedUnit] of [['binance', 'USDT', 1], ['bina
     await clients.loadDepth(q); assert.equal(f.requests.length, exchange === 'binance' ? 3 : 4, 'verified native and independent metadata are reused, every depth read remains fresh');
   });
 }
+
+for (const [exchange, unit, quantities, expected, total] of [
+  ['gate', '0.0001', ['75', '200', '10000', '2226'], [0.0075, 0.02, 1, 0.2226], '1.2501'],
+  ['okx', '0.01', ['188', '75.5', '0.125'], [1.88, 0.755, 0.00125], '2.63625'],
+  ['okx', '0.001', ['188', '75.5', '0.125'], [0.188, 0.0755, 0.000125], '0.263625'],
+  ['okx', '0.0001', ['188', '75.5', '0.125'], [0.0188, 0.00755, 0.0000125], '0.0263625'],
+]) test(`${exchange} ${unit}: native contract quantities avoid multiplication tails and keep numeric depth`, async () => {
+  const q = quote(exchange), f = fixture(q);
+  const bids = quantities.map((quantity, index) => [String(100 - index), quantity]);
+  const asks = quantities.map((quantity, index) => [String(101 + index), quantity]);
+  if (exchange === 'gate') {
+    f.metadata.quanto_multiplier = unit;
+    f.depth.bids = bids.map(([p, s]) => ({ p, s })); f.depth.asks = asks.map(([p, s]) => ({ p, s }));
+  } else {
+    f.metadata.data[0].ctVal = unit;
+    Object.assign(f.depth.data[0], { bids, asks });
+  }
+  const book = await createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q);
+  for (const side of ['bids', 'asks']) {
+    assert.deepEqual(book[side], expected.map((quantity, index) => [side === 'bids' ? 100 - index : 101 + index, quantity]));
+    assert.ok(book[side].every(level => level.every(value => typeof value === 'number' && Number.isFinite(value))));
+    assert.equal(book[side].reduce((sum, [, quantity]) => sum.plus(String(quantity)), D(0)).toString(), total,
+      'the terminal decimal accumulator receives clean base quantities');
+  }
+});
+
+test('contract multipliers retain their supplied decimal precision until final numeric depth conversion', async () => {
+  for (const exchange of ['gate', 'okx']) {
+    const q = quote(exchange), f = fixture(q);
+    if (exchange === 'gate') {
+      f.metadata.quanto_multiplier = '0.00010000000000000001';
+      f.depth.bids = [{ p: '100', s: '75' }]; f.depth.asks = [{ p: '101', s: '75' }];
+    } else {
+      f.metadata.data[0].ctVal = '0.00010000000000000001';
+      Object.assign(f.depth.data[0], { bids: [['100', '75']], asks: [['101', '75']] });
+    }
+    const book = await createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q);
+    // The source product is 0.00750000000000000075; do not erase valid digits to prettify it.
+    assert.equal(book.bids[0][1], 0.007500000000000001);
+    assert.equal(book.asks[0][1], 0.007500000000000001);
+  }
+});
 
 test('external CrossEx positions resolve native contracts without Monitor, including Lighter market IDs', async () => {
   for (const [exchange, currency] of [['binance', 'USDT'], ['bybit', 'USDC'], ['okx', 'USDT'], ['gate', 'USDT'], ['kraken', 'USD'], ['hyperliquid', 'USDT'], ['lighter', 'USDC'], ['deribit', 'USDC']]) {

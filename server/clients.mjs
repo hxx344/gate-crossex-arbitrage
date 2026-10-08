@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import { AppError, monitorUrl, validIdentity } from './model.mjs';
 import { publicSnapshot } from './public-snapshot.mjs';
+import { D } from './money.mjs';
 
 export const CATALOG_URL = 'https://api.gateio.ws/api/v4/crossex/rule/symbols';
 const HYPERLIQUID_INFO = 'https://api.hyperliquid.xyz/info';
@@ -63,8 +64,11 @@ function levels(rows, unit = 1) {
   return rows.slice(0, 100).map(row => {
     const price = Array.isArray(row) ? row[0] : row?.p ?? row?.px ?? row?.price;
     const quantity = Array.isArray(row) ? row[1] : row?.s ?? row?.sz ?? row?.size ?? row?.qty;
-    if (!positive(price) || !positive(quantity) || !positive(Number(quantity) * unit)) throw failure('深度快照价格或数量无效');
-    return [Number(price), Number(quantity) * unit];
+    if (!positive(price) || !positive(quantity)) throw failure('深度快照价格或数量无效');
+    let baseQuantity;
+    try { baseQuantity = D(quantity).times(unit).toNumber(); } catch { throw failure('深度快照价格或数量无效'); }
+    if (!positive(baseQuantity)) throw failure('深度快照价格或数量无效');
+    return [Number(price), baseQuantity];
   });
 }
 
@@ -106,11 +110,11 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
       const data = await cached(`okx:${symbol}`, () => get(`https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId=${encoded}`));
       row = data.data?.find(item => item.instId === symbol);
       if (data.code !== '0' || !row || row.instType !== 'SWAP' || row.ctType !== 'linear' || row.ctValCcy !== rawBase || baseName(row.ctValCcy) !== base || row.settleCcy !== settle || row.state !== 'live' || row.ruleType !== 'normal' || Number(row.expTime) > 0 || !['1', '2'].includes(row.instCategory) || row.instId !== `${rawBase}-${quoteCurrency}-SWAP` || !positive(row.ctVal) || Number(row.ctMult) !== 1) throw failure('OKX 合约数量单位或身份未确认');
-      unit = Number(row.ctVal);
+      unit = row.ctVal;
     } else if (exchange === 'gate') {
       row = await cached(`gate:${symbol}`, () => get(`https://api.gateio.ws/api/v4/futures/usdt/contracts/${encoded}`));
       if (quoteCurrency !== 'USDT' || settle !== 'USDT' || row.name !== symbol || symbol !== `${rawBase}_USDT` || baseName(rawBase) !== base || row.type !== 'direct' || row.in_delisting !== false || !['', 'crypto'].includes(row.contract_type) || row.is_pre_market !== false || (row.status !== undefined && row.status !== 'trading') || !positive(row.quanto_multiplier)) throw failure('Gate 合约数量单位或身份未确认');
-      unit = Number(row.quanto_multiplier);
+      unit = row.quanto_multiplier;
     } else if (exchange === 'kraken') {
       const data = await cached('kraken', () => get(KRAKEN_MARKETS));
       row = data.instruments?.find(item => item.symbol === symbol);
