@@ -5,10 +5,11 @@ import { ArrowLeftRight, Radio, Search } from 'lucide-react';
 import type { Instrument, LiveView, MarketData, PreviewInput } from './live-types';
 import type { Opportunity } from './types';
 import { useMarket } from './live-market';
-import { MarketSelector, nativeSpread } from './TradingTerminal';
+import { nativeSpread } from './TradingTerminal';
 import { amountClass, positiveQuantity, liveStatus } from './live-display';
 import DecimalValue from './DecimalValue';
 import BaseCurrencyPicker from './BaseCurrencyPicker';
+import HedgeLegSelector from './HedgeLegSelector';
 import { availableBase } from './base-currency';
 import { decimalField, percentage } from './position-view';
 import { opportunityStaleReason } from './freshness';
@@ -57,5 +58,5 @@ export default function ManualHedgePanel({ instruments, catalogError, live, budg
 }
 
 function VenueLeg({ label, side, title, instruments, selected, onChange, instrument, data }: { label: string; side: string; title: string; instruments: Instrument[]; selected: string; onChange: (symbol: string) => void; instrument?: Instrument; data: MarketData | null }) {
-  return <article className={'venue-leg ' + side}><div className="leg-top"><span className="leg-letter">{label}</span><strong>{title}</strong><span className={'side-badge ' + (side === 'buy' ? 'long' : 'short')}>{side === 'buy' ? 'LONG' : 'SHORT'}</span></div><MarketSelector key={instrument?.base || ''} instruments={instruments} value={selected} onChange={onChange} label={`${label} 腿交易合约`}/><small className="base-search-hint">仅搜索 {instrument?.base || '当前基础币'} 合约；切换币种请使用上方基础币搜索。</small><div className="leg-quote"><span>{side === 'buy' ? '卖一价格' : '买一价格'}</span><strong><DecimalValue value={side === 'buy' ? data?.ticker?.askPrice : data?.ticker?.bidPrice} kind="price"/></strong><small>{instrument?.quoteCurrency || '—'}</small></div><dl className="leg-market-details"><div><dt>标记价格</dt><dd><DecimalValue value={data?.ticker?.markPrice} kind="price"/></dd></div><div><dt>资金费率</dt><dd>{percentage(data?.ticker?.fundingRate)}</dd></div><div><dt>下次结算</dt><dd>{time(data?.ticker?.nextFundingAt)}</dd></div><div><dt>行情状态</dt><dd className={data?.status === 'live' ? 'positive' : 'warning'}>{liveStatus(data?.status || 'connecting')}</dd></div><div><dt>来源时间</dt><dd>{time(data?.asOf)}</dd></div></dl>{(data?.error || data?.tradingReason) && <p className="inline-state warning">{data.error || data.tradingReason}</p>}</article>;
+  return <article className={'venue-leg ' + side}><div className="leg-top"><span className="leg-letter">{label}</span><strong>{title}</strong><span className={'side-badge ' + (side === 'buy' ? 'long' : 'short')}>{side === 'buy' ? 'LONG' : 'SHORT'}</span></div><HedgeLegSelector instruments={instruments} value={selected} onChange={onChange} label={`${label} 腿`}/><div className="leg-quote"><span>{side === 'buy' ? '卖一价格' : '买一价格'}</span><strong><DecimalValue value={side === 'buy' ? data?.ticker?.askPrice : data?.ticker?.bidPrice} kind="price"/></strong><small>{instrument?.quoteCurrency || '—'}</small></div><dl className="leg-market-details"><div><dt>标记价格</dt><dd><DecimalValue value={data?.ticker?.markPrice} kind="price"/></dd></div><div><dt>资金费率</dt><dd>{percentage(data?.ticker?.fundingRate)}</dd></div><div><dt>下次结算</dt><dd>{time(data?.ticker?.nextFundingAt)}</dd></div><div><dt>行情状态</dt><dd className={data?.status === 'live' ? 'positive' : 'warning'}>{liveStatus(data?.status || 'connecting')}</dd></div><div><dt>来源时间</dt><dd>{time(data?.asOf)}</dd></div></dl>{(data?.error || data?.tradingReason) && <p className="inline-state warning">{data.error || data.tradingReason}</p>}</article>;
 }
