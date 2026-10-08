@@ -19,6 +19,34 @@ async function refresh(f) {
   assert.equal(result.status, 200, JSON.stringify(result.data)); return result.data;
 }
 
+test('real HTTP accepts a within-budget price increase and submits only the reviewed order once', async t => {
+  const f = await fixture(t); await connect(f);
+  f.remote.fillAfterReads = 1;
+  const plan = await preview(f, { kind: 'open', order: { symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'SELL', quantity: '0.5', orderType: 'LIMIT', price: '90', timeInForce: 'GTC' } });
+  assert.equal(plan.legs[0].notionalUSDT, '49.5'); assert.equal(plan.legs[0].singleLegBudgetUSDT, '100');
+  f.remote.depthDelta = 0.01;
+  const execution = await confirm(f, plan, 'http-budget-success-01');
+  assert.equal(execution.state, 'completed'); assert.equal(writes(f).length, 1);
+  assert.equal(writes(f)[0].body.qty, '0.5'); assert.equal(writes(f)[0].body.price, '90');
+  assert.equal(writes(f)[0].body.side, 'SELL'); assert.equal(writes(f)[0].body.time_in_force, 'GTC');
+  assert.equal((await confirm(f, plan, 'http-budget-success-01')).id, execution.id);
+  assert.equal(writes(f).length, 1);
+});
+
+test('real HTTP refresh rejects budget or margin excess without any exchange write', async t => {
+  for (const scenario of ['budget', 'margin']) {
+    const f = await fixture(t);
+    if (scenario === 'margin') f.remote.account.available_margin = '18.15';
+    await connect(f);
+    const plan = await preview(f, { kind: 'open', order: { symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'SELL', quantity: scenario === 'budget' ? '1' : '0.5', orderType: 'LIMIT', price: '90', timeInForce: 'GTC' } });
+    f.remote.depthDelta = scenario === 'budget' ? 2 : 0.01;
+    const result = await f.request('/api/live/confirm', { method: 'POST', body: { previewId: plan.id, requestId: `http-${scenario}-rejection` } });
+    assert.equal(result.status, 409);
+    assert.match(result.data.error, scenario === 'budget' ? /101 USDT.*100 USDT.*1 USDT/ : /保证金不足/);
+    assert.equal(writes(f).length, 0); assert.equal(f.orders.length, 0);
+  }
+});
+
 test('real HTTP protects manual writes with Basic auth, same origin and CSRF', async t => {
   const f = await fixture(t);
   assert.equal((await f.request('/api/health', { auth: false })).status, 200);

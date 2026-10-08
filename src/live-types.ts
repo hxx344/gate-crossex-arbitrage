@@ -26,7 +26,7 @@ export type LivePreview = {
   accountUid: string | null; warnings: string[]; canConfirm: boolean; source?: string;
   risk?: { requiredMargin: string; availableMargin: string; marginCurrency: string; reserveFactor: string; accountMode?: string; asOf?: number; legs: { symbol: string; leverage: string; requiredMargin: string; maxPositionNotional: string; projectedNotional: string; quoteCurrency: string }[] } | null;
   feeEstimate?: { asOf: number | null; error?: string | null; legs: { symbol: string; makerRate: string | null; takerRate: string | null; assumedRate: string | null; estimatedFee: string | null; currency: string; source: string }[] } | null;
-  legs: { exchange: string; symbol: string; side: string; positionSide: string; quantity: string; price?: string | null; referencePrice?: string | null; orderType: string; timeInForce: string; reduceOnly: boolean; base?: string; baseCurrency?: string; quoteCurrency?: string }[];
+  legs: { exchange: string; symbol: string; side: string; positionSide: string; quantity: string; price?: string | null; referencePrice?: string | null; notionalUSDT?: string | null; singleLegBudgetUSDT?: string; budgetPrice?: string; budgetFxRate?: string; orderType: string; timeInForce: string; reduceOnly: boolean; base?: string; baseCurrency?: string; quoteCurrency?: string }[];
 };
 export type LiveView = {
   connection: {
