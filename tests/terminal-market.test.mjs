@@ -286,3 +286,25 @@ test('mark price uses its own time and Bybit subscribes only to supported depth'
   f.advance(11000); frame(socket, 'ticker', { s: symbol, ts: f.now(), bp: '100', ap: '101', lp: '100.5' });
   const value = await f.service.read(symbol); assert.equal(value.status, 'live'); assert.equal(value.ticker.markPrice, null);
 });
+
+test('concurrent catalog lookups retain the twelve-symbol subscription bound', async t => {
+  const hold = deferred();
+  const f = terminalFixture({ display: async symbol => { await hold.promise; return { quote: quote('binance', symbol.split('_')[2]), rule: {} }; } });
+  t.after(async () => { hold.resolve(); await f.service.stop(); });
+  const reads = Array.from({ length: 12 }, (_, i) => f.service.read(`BINANCE_FUTURE_COIN${i}_USDT`));
+  const same = f.service.read('BINANCE_FUTURE_COIN0_USDT');
+  await assert.rejects(f.service.read('BINANCE_FUTURE_EXTRA_USDT'), error => error.status === 429);
+  hold.resolve(); await Promise.all([...reads, same]);
+  const subscribed = new Set(f.Socket.instances[0].sent.filter(m => m.event === 'subscribe').flatMap(m => m.payload));
+  assert.equal(subscribed.size, 12); assert.equal(f.calls.resolve.length, 12);
+});
+
+test('socket open never subscribes a symbol whose catalog identity is still pending', async t => {
+  const hold = deferred();
+  const f = terminalFixture({ display: async symbol => { if (symbol.includes('WAIT')) { await hold.promise; throw new AppError('目录不存在'); } return { quote: quote('binance'), rule: {} }; } });
+  t.after(async () => { hold.resolve(); await f.service.stop(); });
+  const rejected = assert.rejects(f.service.read('BINANCE_FUTURE_WAIT_USDT'), /目录不存在/);
+  await f.service.read(SYMBOL);
+  assert.ok(f.Socket.instances[0].sent.every(m => !m.payload.includes('BINANCE_FUTURE_WAIT_USDT')));
+  hold.resolve(); await rejected;
+});

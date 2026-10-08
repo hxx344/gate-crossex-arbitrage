@@ -52,7 +52,7 @@ export async function createLiveHttpFixture({ dataDir, distDir, intervalMs = 0 }
       available_margin: '9876.50', margin_balance: '10000', initial_margin: '123.50', maintenance_margin: '30', initial_margin_rate: '0.01235', maintenance_margin_rate: '0.003',
       assets: [{ coin: 'USDT', exchange_type: 'CROSSEX', balance: '10000', equity: '10000', available_balance: '9876.50', upnl: '0' },
         { coin: 'USDC', exchange_type: 'BYBIT', balance: '250', equity: '252.50', available_balance: '240', upnl: '2.50' }] },
-    positions: [], orders: [], trades: [], accountBook: [], nextCreate: 'fill', fillAfterReads: 2, marketOffline: false,
+    positions: [], orders: [], trades: [], accountBook: [], nextCreate: 'fill', fillAfterReads: 2, marketOffline: false, depthDelta: 0,
   };
   function addOrder(input = {}) {
     const now = String(Date.now());
@@ -138,7 +138,7 @@ export async function createLiveHttpFixture({ dataDir, distDir, intervalMs = 0 }
   })));
   const app = createApp({ dataDir: directory, initialPassword: password, intervalMs, ...(distDir ? { distDir } : {}), logger: () => {},
     marketOptions: { feedReader: async () => { if (remote.marketOffline) throw new Error('Isolated Monitor offline'); return feed(); },
-      catalogReader: async () => clone(catalog), depthReader: async q => ({ at: Date.now(), bids: [[q.bid, 100]], asks: [[q.ask, 100]] }),
+      catalogReader: async () => clone(catalog), depthReader: async q => ({ at: Date.now(), bids: [[q.bid + remote.depthDelta, 100]], asks: [[q.ask + remote.depthDelta, 100]] }),
       identityReader: async symbol => { const [exchange, , base, currency] = symbol.split('_'); return quote(exchange.toLowerCase(), Date.now(), base, currency); },
       fxReader: async () => ({ baseCurrency: 'USDT', staleAfterMs: 180000, rates: { USDC: { bid: 1, ask: 1, at: Date.now(), source: 'isolated-http-fixture' } } }) },
     terminalOptions: { WebSocketImpl: FixtureSocket,

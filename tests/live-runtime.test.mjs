@@ -71,6 +71,32 @@ test('connection encrypts credentials and previews/background reads never write 
   assert.ok(!readFileSync(join(f.directory, 'crossex.sqlite')).includes(Buffer.from('test-secret-5678')));
 });
 
+test('confirmation applies refreshed valuations to total, margin and risk-tier checks before any write', async t => {
+  for (const scenario of ['total', 'margin', 'tier']) {
+    const f = fixture(t), previewOpen = f.market.previewOpen;
+    if (scenario === 'total') f.market.previewOpen = async signal => { const plan = await previewOpen(signal); plan.limits.maxTotalNotional = '205'; return plan; };
+    if (scenario === 'margin') f.account({ available_margin: '23' });
+    if (scenario === 'tier') f.client.getRiskLimits = async selected => selected.map(symbol => ({ symbol, tiers: [{ leverage_max: '100', max_risk_limit_value: '105' }] }));
+    await f.connect(); const preview = await f.preview();
+    f.market.revalidateOpen = async plan => { for (const leg of plan.legs) { leg.referencePrice = '110'; leg.notionalUSDT = '110'; } };
+    await assert.rejects(f.confirm(preview), { message: scenario === 'total' ? '订单超过账户总名义额上限' : scenario === 'margin' ? '账户可用保证金不足以覆盖订单及 10% 预留' : `${symbols[0]} 超过当前杠杆允许的风险档位名义额` });
+    assert.deepEqual(f.calls.create, []); assert.deepEqual(f.calls.cancel, []);
+    assert.equal(f.store.db.prepare('SELECT count(*) n FROM live_orders').get().n, 0);
+    assert.equal(f.store.db.prepare('SELECT count(*) n FROM live_executions').get().n, 0);
+  }
+});
+
+test('refreshed valuation below all limits preserves exact orders, saved preview and confirmation idempotency', async t => {
+  const f = fixture(t); await f.connect(); const preview = await f.preview();
+  const original = f.store.db.prepare('SELECT json FROM live_previews WHERE id=?').get(preview.id).json;
+  f.market.revalidateOpen = async plan => { for (const leg of plan.legs) { leg.referencePrice = '110'; leg.notionalUSDT = '110'; } };
+  const result = await f.confirm(preview);
+  assert.equal(result.state, 'completed'); assert.equal(f.calls.create.length, 2);
+  assert.deepEqual(f.calls.create.map(({ qty, price, side }) => ({ qty, price, side })), preview.legs.map(({ quantity, price, side }) => ({ qty: quantity, price, side })));
+  assert.equal(f.store.db.prepare('SELECT json FROM live_previews WHERE id=?').get(preview.id).json, original);
+  assert.equal((await f.confirm(preview)).id, result.id); assert.equal(f.calls.create.length, 2);
+});
+
 test('connection setup and background synchronization do not require the full display view', async t => {
   const f = fixture(t);
   f.market.view = () => { throw new Error('Large market display is unavailable'); };

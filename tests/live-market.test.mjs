@@ -146,23 +146,63 @@ test('market tickets honor their own size cap and require current fillable depth
   await assert.rejects(f.market.revalidateOpen(p), /深度不足/);
 });
 
-test('confirmation cannot raise a reviewed margin or risk valuation even below the single-leg budget', async t => {
+test('confirmation refreshes increased valuation within budget without changing the submitted order', async t => {
   const f = fixture(t); f.market.settings({ config: { notionalPerLeg: 200 } });
   const plan = await f.market.previewDirect({ symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'SELL', quantity: '1', orderType: 'LIMIT', price: '90', timeInForce: 'GTC' });
+  assert.equal(plan.legs[0].notionalUSDT, '99');
   f.setDepth(q => ({ ...book(q, epoch), bids: [[110, 100]], asks: [[111, 100]] }));
-  await assert.rejects(f.market.revalidateOpen(plan), /提高订单估值/);
+  await f.market.revalidateOpen(plan);
+  const leg = plan.legs[0];
+  assert.equal(leg.referencePrice, '110'); assert.equal(leg.notionalUSDT, '110');
+  assert.equal(leg.budgetPrice, '110'); assert.equal(leg.budgetFxRate, '1'); assert.equal(leg.singleLegBudgetUSDT, '200');
+  assert.equal(leg.quantity, '1'); assert.equal(leg.price, '90'); assert.equal(leg.timeInForce, 'GTC');
 });
 
-test('confirmation rechecks FX against the exact previewed USDT valuation', async t => {
+test('confirmation refreshes FX valuation within budget and rejects conversion above the cap', async t => {
   let rate = 1;
   const q = { ...quote('bybit'), symbol: 'BTCPERP', quoteCurrency: 'USDC', settlementCurrency: 'USDC', collateralCurrency: 'USDC', counterCurrency: 'USDC', crossexSymbol: 'BYBIT_FUTURE_BTC_USDC', contractKind: 'linear' };
   const f = fixture(t, { identityReader: async () => q, fxReader: async () => ({ baseCurrency: 'USDT', staleAfterMs: 180000, rates: { USDC: { bid: rate, ask: rate, at: epoch, source: 'isolated-test' } } }) });
   f.setRules([{ ...catalog[1], symbol: q.crossexSymbol, max_limit_size: '10000' }]);
   const plan = await f.market.previewDirect({ symbol: q.crossexSymbol, side: 'BUY', quantity: '0.1', orderType: 'LIMIT', price: '100', timeInForce: 'GTC' });
   rate = 1.01;
-  await assert.rejects(f.market.revalidateOpen(plan), /提高订单估值/);
+  await f.market.revalidateOpen(plan);
+  assert.equal(plan.legs[0].notionalUSDT, '10.403'); assert.equal(plan.legs[0].budgetFxRate, '1.01');
   rate = 0.99;
   await f.market.revalidateOpen(plan);
+  assert.equal(plan.legs[0].notionalUSDT, '10.197');
+  rate = 10;
+  await assert.rejects(f.market.revalidateOpen(plan), /103 USDT.*100 USDT.*3 USDT/);
+  assert.equal(plan.legs[0].notionalUSDT, '10.197', 'a failed revalidation must not partially mutate the plan');
+  assert.equal(plan.legs[0].price, '100'); assert.equal(plan.legs[0].quantity, '0.1');
+});
+
+test('single-leg preview and confirmation report exact budget boundary failures', async t => {
+  const f = fixture(t), input = { symbol: 'BINANCE_FUTURE_BTC_USDT', side: 'BUY', quantity: '1', orderType: 'LIMIT', price: '100', timeInForce: 'GTC' };
+  const plan = await f.market.previewDirect(input);
+  assert.equal(plan.legs[0].notionalUSDT, '100');
+  assert.equal(plan.legs[0].singleLegBudgetUSDT, '100');
+  await f.market.revalidateOpen(plan);
+  await assert.rejects(f.market.previewDirect({ ...input, orderType: 'MARKET', price: undefined, timeInForce: 'IOC' }), /100\.05 USDT.*100 USDT.*0\.05 USDT/);
+  f.setDepth(q => ({ ...book(q, epoch), asks: [[100.0000001, 100]] }));
+  await assert.rejects(f.market.revalidateOpen(plan), error => error.status === 409 && /100\.000001 USDT.*100 USDT.*0\.000001 USDT/.test(error.message));
+  assert.equal(plan.legs[0].notionalUSDT, '100');
+});
+
+test('manual pairs and Monitor orders accept SELL improvements only within each leg budget', async t => {
+  for (const source of ['pair', 'monitor']) {
+    const f = fixture(t);
+    const plan = source === 'pair' ? await f.market.previewPair({ longSymbol: 'BINANCE_FUTURE_BTC_USDT', shortSymbol: 'BYBIT_FUTURE_BTC_USDT', quantity: '0.98' }) : await f.market.previewOpen(`signal-${epoch}`);
+    const orders = plan.legs.map(({ price, quantity, side }) => ({ price, quantity, side }));
+    assert.ok(plan.legs.every(l => l.singleLegBudgetUSDT === '100'));
+    f.setDepth(q => ({ ...book(q, epoch), bids: [[q.exchange === 'bybit' ? 102.01 : q.bid, 100]] }));
+    await f.market.revalidateOpen(plan);
+    assert.equal(plan.legs[1].notionalUSDT, '99.9698');
+    assert.deepEqual(plan.legs.map(({ price, quantity, side }) => ({ price, quantity, side })), orders);
+    const valid = structuredClone(plan);
+    f.setDepth(q => ({ ...book(q, epoch), bids: [[q.exchange === 'bybit' ? 102.05 : q.bid, 100]] }));
+    await assert.rejects(f.market.revalidateOpen(plan), /100\.009 USDT.*100 USDT.*0\.009 USDT/);
+    assert.deepEqual(plan, valid);
+  }
 });
 
 test('large market snapshots keep refresh and views bounded and lightweight reads skip candidate work', async t => {

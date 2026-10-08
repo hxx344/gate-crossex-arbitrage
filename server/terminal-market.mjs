@@ -118,7 +118,7 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
     let current;
     try { current = new WebSocketImpl(WS_URL, { maxPayload: 1000000, handshakeTimeout: 8000 }); } catch { return; }
     socket = current;
-    current.on('open', () => { if (current === socket) send('subscribe', [...entries].filter(([, e]) => active(e)).map(([s]) => s)); });
+    current.on('open', () => { if (current === socket) send('subscribe', [...entries].filter(([, e]) => active(e) && e.display).map(([s]) => s)); });
     current.on('error', () => { current.close(); });
     current.on('close', () => { if (current === socket) { socket = null; subscribed.clear(); } });
     current.on('message', raw => {
@@ -154,7 +154,7 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
   }
   const sweep = setInterval(() => {
     const removed = [];
-    for (const [symbol, e] of entries) if (!active(e) && !e.flight) { removed.push(symbol); entries.delete(symbol); }
+    for (const [symbol, e] of entries) if (!active(e) && !e.flight && !e.displayFlight) { removed.push(symbol); entries.delete(symbol); }
     send('unsubscribe', removed);
     if (!entries.size) { socket?.close(); socket = null; subscribed.clear(); }
     else if (socket?.readyState === 1) socket.ping();
@@ -166,7 +166,7 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
     let e = entries.get(symbol);
     if (!e) {
       if (entries.size >= 12) {
-        const oldest = [...entries].filter(([, x]) => !x.flight).sort((a, b) => a[1].touched - b[1].touched)[0];
+        const oldest = [...entries].filter(([, x]) => !x.flight && !x.displayFlight).sort((a, b) => a[1].touched - b[1].touched)[0];
         if (!oldest) throw new AppError('行情查询繁忙，请稍后重试', 429);
         send('unsubscribe', [oldest[0]]); entries.delete(oldest[0]);
       }
@@ -174,9 +174,11 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
     }
     e.touched = clock();
     // A current CrossEx listing authorizes public subscription, not execution.
-    try { e.display = await (market.resolveDisplaySymbol ?? market.resolveSymbol)(symbol); }
-    catch (error) { send('unsubscribe', [symbol]); entries.delete(symbol); throw error; }
+    if (!e.displayFlight) e.displayFlight = Promise.resolve().then(() => (market.resolveDisplaySymbol ?? market.resolveSymbol)(symbol)).finally(() => { e.displayFlight = null; });
+    try { e.display = await e.displayFlight; }
+    catch (error) { if (entries.get(symbol) === e) { send('unsubscribe', [symbol]); entries.delete(symbol); } throw error; }
     if (stopped) throw new AppError('行情服务已停止', 503);
+    if (entries.get(symbol) !== e) throw new AppError('行情查询已失效，请重试', 409);
     ensureSocket(); send('subscribe', [symbol]);
     if (!e.flight && clock() - e.bookAttempt >= 1500) {
       e.bookAttempt = clock();
@@ -231,5 +233,5 @@ export function createTerminalMarket({ market, depthReader = loadManualDepth, ca
       book, candles: history?.data ?? [], candleError: history?.error ?? (!e.quote ? '尚未确认原生历史 K 线来源' : null), candleAsOf: history && Number.isFinite(history.at) ? history.at : null,
       trades: e.trades.filter(t => clock() - t.at < 300000).map(t => ({ ...t, quantity: unit ? D(t.quantity).times(unit).toString() : t.quantity, quantityUnit: unit ? 'base' : 'contracts' })), interval };
   }
-  return { read, async stop() { stopped = true; clearInterval(sweep); socket?.close(); socket = null; await Promise.allSettled([...entries.values()].flatMap(e => [e.flight, ...[...e.candles.values()].map(h => h.flight)])); entries.clear(); } };
+  return { read, async stop() { stopped = true; clearInterval(sweep); socket?.close(); socket = null; await Promise.allSettled([...entries.values()].flatMap(e => [e.displayFlight, e.flight, ...[...e.candles.values()].map(h => h.flight)])); entries.clear(); } };
 }

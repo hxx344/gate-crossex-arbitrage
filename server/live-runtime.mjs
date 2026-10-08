@@ -465,10 +465,13 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const { record, cache } = freshCache();
     if (record.version !== plan.connectionVersion || record.accountUid !== plan.accountUid || accountFingerprint(cache) !== plan.accountFingerprint || configFingerprint() !== plan.configFingerprint) fail('账户、持仓或设置已变化，请重新预览');
     if (record.tradePermission === 'denied') fail('此凭据没有交易权限');
-    checkConflicts(plan, cache); await withinDeadline(() => validateLimits(plan, cache), deadline);
+    checkConflicts(plan, cache);
+    // Market refreshes valuation without changing the user's quantity or order price.
+    // Every financial check must run afterwards; otherwise it would use stale amounts.
+    await withinDeadline(() => plan.kind === 'open' ? market.revalidateOpen(plan) : market.revalidateClose(plan), deadline);
+    await withinDeadline(() => validateLimits(plan, cache), deadline);
     const currentRisk = await withinDeadline(() => riskPreview(plan, record, cache), deadline);
     if (currentRisk && plan.risk && hash(currentRisk.legs.map(l => [l.symbol, l.leverage])) !== hash(plan.risk.legs.map(l => [l.symbol, l.leverage]))) fail('账户杠杆已变化，请重新预览');
-    await withinDeadline(() => plan.kind === 'open' ? market.revalidateOpen(plan) : market.revalidateClose(plan), deadline);
     assertOwner();
     if (remaining(deadline) <= 0 || clock() >= plan.expiresAt || connectionRecord()?.version !== record.version || configFingerprint() !== plan.configFingerprint) fail('预览或连接已变化，请重新预览');
     const execution = { id: id(), requestId, previewId: plan.id, kind: plan.kind, base: plan.base, accountUid: record.accountUid, connectionVersion: record.version, createdAt: clock(), updatedAt: clock() };

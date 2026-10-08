@@ -100,13 +100,14 @@ function checkQuantity(quantity, price, rule, orderType = 'LIMIT') {
   const maximum = orderType === 'MARKET' ? rule.max_market_size : rule.max_limit_size;
   if (maximum !== undefined && maximum !== null && q.gt(maximum)) throw new AppError('数量超过合约单笔上限，请分次手动处理');
 }
-function validatePreviewValue(leg, latestPrice, fx, now, budget) {
-  const price = Decimal.max(leg.price, latestPrice), approvedPrice = Decimal.max(leg.price, leg.referencePrice);
-  const value = D(leg.quantity).times(price).times(fxRate(leg.settlementCurrency, fx, now).ask);
-  if (value.gt(budget)) throw new AppError('行情或汇率变化后超过单腿预算，请重新预览');
-  // Runtime's leverage, risk-tier and total-notional checks consume the reviewed
-  // amounts. Never silently approve an increased valuation during confirmation.
-  if (price.gt(approvedPrice) || !positiveDecimal(leg.notionalUSDT) || value.gt(leg.notionalUSDT)) throw new AppError('行情或汇率已提高订单估值，请重新预览保证金与风险限制', 409);
+function budgetValue(leg, latestPrice, fx, now, budget) {
+  const price = Decimal.max(leg.price, latestPrice), rate = D(fxRate(leg.settlementCurrency, fx, now).ask);
+  const value = D(leg.quantity).times(price).times(rate);
+  if (value.gt(budget)) {
+    const show = n => D(n).toDecimalPlaces(6, Decimal.ROUND_UP).toString();
+    throw new AppError(`${leg.symbol} 订单校验金额约 ${show(value)} USDT，超过单腿预算 ${show(budget)} USDT（超出约 ${show(value.minus(budget))} USDT）。预算按数量 × 较高的委托价或盘口估值 × 汇率计算，是名义额而非保证金`, 409);
+  }
+  return { referencePrice: String(latestPrice), notionalUSDT: value.toString(), budgetPrice: price.toString(), budgetFxRate: rate.toString(), singleLegBudgetUSDT: D(budget).toString() };
 }
 
 /** Read-only market discovery and order previews. No private client or writer. */
@@ -262,8 +263,8 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       checkQuantity(quantity, leg.price, rules[i]);
       const estimate = depthEstimate(books[i], leg.side, quantity, leg.price);
       checkQuantity(quantity, estimate.price, rules[i]);
-      Object.assign(leg, { quantity, referencePrice: estimate.price, notional: D(quantity).times(leg.price).toString(),
-        notionalUSDT: D(quantity).times(Decimal.max(leg.price, estimate.price)).times(fxRate(leg.settlementCurrency, fx, clock()).ask).toString(), sourceAt: books[i].at });
+      Object.assign(leg, { quantity, ...budgetValue({ ...leg, quantity }, estimate.price, fx, clock(), c.notionalPerLeg),
+        notional: D(quantity).times(leg.price).toString(), sourceAt: books[i].at });
     }
     const fees = feeSnapshot(c, ...quotes);
     const expectedNetBps = (referencePrice(quotes[1], legs[1].referencePrice, 'sell', fx, clock()) / referencePrice(quotes[0], legs[0].referencePrice, 'buy', fx, clock()) - 1) * 10000 - roundTripFeeBps(fees) - 2 * c.slippageBps;
@@ -296,7 +297,10 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     const c = config(), fees = feeSnapshot(c, ...quotes);
     const net = (referencePrice(quotes[1], prices[1], 'sell', fx, clock()) / referencePrice(quotes[0], prices[0], 'buy', fx, clock()) - 1) * 10000 - roundTripFeeBps(fees) - 2 * c.slippageBps;
     if (net < c.minNetBps) throw new AppError('最新深度的净价差已不足，请重新预览');
-    for (const [i, leg] of plan.legs.entries()) validatePreviewValue(leg, prices[i], fx, clock(), c.notionalPerLeg);
+    // Refresh valuation only; the confirmed order's quantity and price never change.
+    // Runtime rechecks total exposure, margin and risk tiers using these values.
+    const values = plan.legs.map((leg, i) => budgetValue(leg, prices[i], fx, clock(), c.notionalPerLeg));
+    plan.legs.forEach((leg, i) => Object.assign(leg, values[i]));
     return true;
   }
   // Manual ticket and A/B hedge concepts follow your-quantguy/gate-crossex,
@@ -343,10 +347,9 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       checkPrice(price, rule); checkQuantity(request.quantity, price, rule, request.orderType);
       const immediate = request.orderType === 'MARKET' || ['IOC', 'FOK'].includes(request.timeInForce);
       const estimate = immediate ? depthEstimate(books[i], request.side, request.quantity, price) : { price: leg.referencePrice };
-      const notionalUSDT = D(request.quantity).times(Decimal.max(price, estimate.price)).times(fxRate(settlement(q), fx, clock()).ask).toString();
-      if (D(notionalUSDT).gt(c.notionalPerLeg)) throw new AppError('订单超过单腿预算，请修改数量或设置');
+      const valuation = budgetValue({ ...leg, price, quantity: request.quantity }, estimate.price, fx, clock(), c.notionalPerLeg);
       return { ...leg, price, quantity: request.quantity, orderType: request.orderType, timeInForce: request.timeInForce,
-        referencePrice: estimate.price, notional: D(request.quantity).times(price).toString(), notionalUSDT, sourceAt: books[i].at };
+        ...valuation, notional: D(request.quantity).times(price).toString(), sourceAt: books[i].at };
     });
     return { kind: 'open', source, base: quotes[0].base, marketRevision, sourceAt: Math.min(...books.map(b => b.at)), expiresAt: clock() + 30000, legs,
       expectedNetBps: null, limits: { maxOpen: c.maxOpen, maxTotalNotional: c.maxTotalNotional, cooldownSeconds: c.cooldownSeconds },
@@ -374,15 +377,17 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     const resolved = await Promise.all(plan.legs.map(l => resolveSymbol(l.symbol)));
     if (plan.source === 'pair' && !validManualPair(resolved[0]?.quote, resolved[1]?.quote)) throw new AppError('双腿合约身份不再可比，请重新预览');
     const { books, fx } = await booksAndFx(resolved.map(r => r.quote), true, manualDepthReader);
+    const values = [];
     for (const [i, leg] of plan.legs.entries()) {
       const { quote, rule } = resolved[i];
       if (contractIdentity(quote) !== contractIdentity(leg.quote)) throw new AppError('合约身份已变化，请重新预览');
       checkPrice(leg.price, rule); checkQuantity(leg.quantity, leg.price, rule, leg.orderType);
       const immediate = leg.orderType === 'MARKET' || ['IOC', 'FOK'].includes(leg.timeInForce);
       const reference = immediate ? depthEstimate(books[i], leg.side, leg.quantity, leg.price).price : leg.side === 'BUY' ? books[i].asks[0][0] : books[i].bids[0][0];
-      validatePreviewValue(leg, reference, fx, clock(), c.notionalPerLeg);
+      values.push(budgetValue(leg, reference, fx, clock(), c.notionalPerLeg));
     }
     if (revision() !== plan.marketRevision || config().entryPaused) throw new AppError('设置已变化，请重新预览', 409);
+    plan.legs.forEach((leg, i) => Object.assign(leg, values[i]));
     return true;
   }
   async function previewClose(position, requestedQuantity) {

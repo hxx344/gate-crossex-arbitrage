@@ -3,7 +3,7 @@ import type { Config } from './types';
 
 export type LiveConfig = Pick<Config, 'entryPaused' | 'monitorUrl' | 'monitorUsername' | 'hasMonitorPassword' | 'notionalPerLeg' | 'maxOpen' | 'maxTotalNotional' | 'feeBps' | 'feeSchedule' | 'slippageBps' | 'minNetBps' | 'cooldownSeconds'>;
 const numericFields = [
-  ['notionalPerLeg', '每次开仓单腿预算', 'USDT'], ['maxTotalNotional', '总名义额上限', 'USDT'],
+  ['notionalPerLeg', '单腿名义额上限（非保证金）', 'USDT'], ['maxTotalNotional', '总名义额上限', 'USDT'],
   ['maxOpen', '持仓组数上限', '组'], ['slippageBps', '价格偏离上限', 'bp'],
   ['minNetBps', '机会最低预算净价差', 'bp'], ['feeBps', '默认手续费预算', 'bp'],
   ['cooldownSeconds', '同币种操作冷却', '秒'],
