@@ -45,7 +45,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     void market.refreshSource();
     if (runningTick) return;
     runningTick = true;
-    try { await Promise.all([market.refreshCatalog(), live.refresh()]); }
+    try { await Promise.all([market.refreshCatalog(), live.refresh({ includeView: false })]); }
     catch { logger('账户或行情本轮读取未完成，等待下一次检查'); }
     finally { runningTick = false; }
   };
@@ -66,7 +66,10 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
         const expected = publicOrigin || `http://${req.headers.host}`;
         if (req.headers.origin !== expected || req.headers['sec-fetch-site'] === 'cross-site' || !equal(req.headers['x-csrf-token'] || '', csrf)) throw new AppError('操作来源或会话校验失败，请刷新页面', 403);
       }
-      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...live.view(), csrfToken: csrf });
+      if (route === '/api/bootstrap' && req.method === 'GET') return json(res, 200, {
+        now: Date.now(), config: { ...market.config(), hasMonitorPassword: !!store.get('monitorPassword') }, connection: live.connectionView(), csrfToken: csrf,
+      });
+      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...live.view({ includeOpportunities: url.searchParams.get('opportunities') !== '0' }), csrfToken: csrf });
       if (route === '/api/hub/summary' && req.method === 'GET') {
         if (url.searchParams.get('schemaVersion') === '2') return json(res, 200, { schemaVersion: 2, data: live.summary() });
         const value = live.summary();
@@ -75,7 +78,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
       if (route === '/api/settings' && req.method === 'PUT') return json(res, 200, market.settings(await body(req)));
       if (route === '/api/live/connection' && req.method === 'PUT') return json(res, 200, await live.connection(await body(req)));
       if (route === '/api/live/connection' && req.method === 'DELETE') return json(res, 200, await live.disconnect());
-      if (route === '/api/live/refresh' && req.method === 'POST') { await body(req); await live.refresh(); return json(res, 200, live.view()); }
+      if (route === '/api/live/refresh' && req.method === 'POST') { await body(req); await live.refresh({ includeView: false }); return json(res, 200, live.view({ includeOpportunities: false })); }
       if (route === '/api/live/instruments' && req.method === 'GET') return json(res, 200, await market.instruments());
       if (route === '/api/live/market' && req.method === 'GET') return json(res, 200, await terminal.read(url.searchParams.get('symbol'), url.searchParams.get('interval') || '5m'));
       if (route === '/api/live/preview' && req.method === 'POST') return json(res, 200, await live.preview(await body(req)));

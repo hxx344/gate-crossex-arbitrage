@@ -165,6 +165,13 @@ for (const blocked of ['catalog', 'account read']) test(`app keeps refreshing ev
   await turn();
   const connecting = blocked === 'account read' ? app.live.connection({ apiKey: 'isolated-key', apiSecret: 'isolated-secret' }) : Promise.resolve();
   await entered.promise;
+  await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
+  const bootstrap = await fetch(`http://127.0.0.1:${app.server.address().port}/api/bootstrap`, {
+    headers: { Authorization: `Basic ${Buffer.from('admin:source-refresh-test-password').toString('base64')}` }, signal: AbortSignal.timeout(3000),
+  });
+  assert.equal(bootstrap.status, 200, 'connection controls must load while an external source is pending');
+  const initial = await bootstrap.json();
+  assert.ok(initial.csrfToken); assert.equal(initial.connection.configured, false);
   const initialReads = reads;
   for (let i = 1; i <= 3; i++) {
     now += 5000; t.mock.timers.tick(5000); await turn();

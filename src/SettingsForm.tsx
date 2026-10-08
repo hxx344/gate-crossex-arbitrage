@@ -9,34 +9,42 @@ const numericFields = [
   ['cooldownSeconds', '同币种操作冷却', '秒'],
 ] as const;
 
-export default function SettingsForm({ config, configured, busy, save, connect, disconnect }: {
-  config: LiveConfig; configured: boolean; busy: boolean;
+export default function SettingsForm({ config, configured, ready, loading, loadError, retry, busy, save, connect, disconnect }: {
+  config: LiveConfig | null; configured: boolean | null; ready: boolean; loading: boolean; loadError: string; retry: () => void; busy: boolean;
   save: (input: object) => Promise<boolean>;
   connect: (input: { apiKey: string; apiSecret: string }) => Promise<boolean>;
   disconnect: () => Promise<boolean>;
 }) {
-  const [draft, setDraft] = useState(config);
-  const [password, setPassword] = useState(''), [clearPassword, setClearPassword] = useState(false);
   const [apiKey, setApiKey] = useState(''), [apiSecret, setApiSecret] = useState('');
-  const [saved, setSaved] = useState(false), [connectionSaved, setConnectionSaved] = useState(false), [confirmDisconnect, setConfirmDisconnect] = useState(false);
+  const [connectionSaved, setConnectionSaved] = useState(false), [confirmDisconnect, setConfirmDisconnect] = useState(false);
   return <div className="settings-layout">
-    <form className="panel settings-panel" onSubmit={async e => {
-      e.preventDefault(); setConnectionSaved(false);
+    <form className="panel settings-panel" aria-label="Gate CrossEx 实盘连接" onSubmit={async e => {
+      e.preventDefault(); if (!ready || busy) return; setConnectionSaved(false);
       const credentials = { apiKey: apiKey.trim(), apiSecret: apiSecret.trim() };
       setApiKey(''); setApiSecret('');
       if (await connect(credentials)) { setConnectionSaved(true); setConfirmDisconnect(false); }
     }}>
       <h2>Gate CrossEx 实盘连接</h2>
       <p className="muted">凭据仅发送到此服务进行连接校验。已保存的 Key 与 Secret 不会回显。</p>
+      <p className="muted" role="status">连接配置：{configured == null ? '待读取' : configured ? '已有账户连接' : '尚未配置账户'}</p>
+      {loadError ? <div className="notice warning" role="alert"><span>{loadError}{ready ? ' 已保留先前读取的连接信息。' : ' 可先填写凭据，读取成功后再提交。'}</span><button type="button" disabled={busy || loading} onClick={retry}>{loading ? '正在重试…' : '重试连接信息'}</button></div> : !ready ? <div className="notice" role="status"><span>正在读取连接与授权信息，可先填写凭据；读取完成后可提交。</span><button type="button" disabled={busy || loading} onClick={retry}>重试连接信息</button></div> : null}
       <div className="form-grid connection-fields">
         <label>API Key<input required type="password" autoComplete="new-password" spellCheck={false} value={apiKey} onChange={e => { setApiKey(e.target.value); setConnectionSaved(false); }} placeholder={configured ? '输入新的 Key 以更换连接' : '输入 Gate API Key'}/></label>
         <label>API Secret<input required type="password" autoComplete="new-password" spellCheck={false} value={apiSecret} onChange={e => { setApiSecret(e.target.value); setConnectionSaved(false); }} placeholder="输入 Gate API Secret"/></label>
       </div>
-      <div className="save-row"><button type="submit" className="primary" disabled={busy || !apiKey.trim() || !apiSecret.trim()}>{busy ? '正在处理…' : configured ? '更换并校验连接' : '连接并校验账户'}</button>{connectionSaved && <span role="status" className="positive">连接信息已更新</span>}</div>
-      {configured && <div className="disconnect-row">{confirmDisconnect ? <><span>移除连接后无法在此查询或操作现有仓位。</span><button type="button" disabled={busy} onClick={async () => { if (await disconnect()) setConfirmDisconnect(false); }}>确认移除连接</button><button type="button" onClick={() => setConfirmDisconnect(false)}>保留连接</button></> : <button type="button" className="text-button" disabled={busy} onClick={() => setConfirmDisconnect(true)}>移除此连接</button>}</div>}
+      <div className="save-row"><button type="submit" className="primary" disabled={busy || !ready || !apiKey.trim() || !apiSecret.trim()}>{busy ? '正在处理…' : !ready ? '等待读取连接信息' : configured ? '更换并校验连接' : '连接并校验账户'}</button>{connectionSaved && <span role="status" className="positive">连接信息已更新</span>}</div>
+      {configured === true && <div className="disconnect-row">{confirmDisconnect ? <><span>移除连接后无法在此查询或操作现有仓位。</span><button type="button" disabled={busy || !ready} onClick={async () => { if (ready && await disconnect()) setConfirmDisconnect(false); }}>确认移除连接</button><button type="button" onClick={() => setConfirmDisconnect(false)}>保留连接</button></> : <button type="button" className="text-button" disabled={busy || !ready} onClick={() => setConfirmDisconnect(true)}>移除此连接</button>}</div>}
     </form>
-    <form onChange={() => setSaved(false)} onSubmit={async e => {
-      e.preventDefault(); setSaved(false);
+    {config ? <SettingsPreferences config={config} ready={ready} busy={busy} save={save}/> : <section className="panel settings-panel"><h2>行情与额度设置</h2><p className="muted">{loadError ? '配置读取失败。重试连接信息后，已有行情与额度设置会显示在这里。' : '正在读取已保存的行情与额度设置…'}</p></section>}
+  </div>;
+}
+
+/** Keep the user's draft stable across bootstrap refreshes and normal account polling. */
+function SettingsPreferences({ config, ready, busy, save }: { config: LiveConfig; ready: boolean; busy: boolean; save: (input: object) => Promise<boolean> }) {
+  const [draft, setDraft] = useState(config);
+  const [password, setPassword] = useState(''), [clearPassword, setClearPassword] = useState(false), [saved, setSaved] = useState(false);
+  return <form aria-label="行情与额度设置" onChange={() => setSaved(false)} onSubmit={async e => {
+      e.preventDefault(); if (busy || !ready) return; setSaved(false);
       const { hasMonitorPassword: _hasPassword, ...editable } = draft;
       if (await save({ config: editable, ...(password ? { monitorPassword: password } : {}), clearMonitorPassword: clearPassword })) { setSaved(true); setPassword(''); setClearPassword(false); }
     }}>
@@ -56,8 +64,7 @@ export default function SettingsForm({ config, configured, busy, save, connect, 
         <label className="check"><input type="checkbox" checked={draft.entryPaused} onChange={e => setDraft(value => ({ ...value, entryPaused: e.target.checked }))}/>暂停新开仓，保留手动平仓与撤单</label>
         <div className="form-grid">{numericFields.map(([key, label, unit]) => <label key={key}>{label}<div className="input-unit"><input required type="number" min="0" step={key === 'maxOpen' ? '1' : 'any'} value={draft[key]} onChange={e => setDraft(value => ({ ...value, [key]: Number(e.target.value) }))}/><span>{unit}</span></div></label>)}</div>
         <p className="muted">持仓额度按每组两条持仓腿计算，已有单腿也占用额度。</p>
-        <div className="save-row"><button className="primary" disabled={busy} type="submit">{busy ? '正在保存…' : '保存行情与额度设置'}</button>{saved && <span role="status" className="positive">已保存</span>}</div>
+        <div className="save-row"><button className="primary" disabled={busy || !ready} type="submit">{busy ? '正在保存…' : '保存行情与额度设置'}</button>{saved && <span role="status" className="positive">已保存</span>}</div>
       </section>
-    </form>
-  </div>;
+    </form>;
 }

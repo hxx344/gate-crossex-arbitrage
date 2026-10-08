@@ -71,6 +71,40 @@ test('connection encrypts credentials and previews/background reads never write 
   assert.ok(!readFileSync(join(f.directory, 'crossex.sqlite')).includes(Buffer.from('test-secret-5678')));
 });
 
+test('connection setup and background synchronization do not require the full display view', async t => {
+  const f = fixture(t);
+  f.market.view = () => { throw new Error('Large market display is unavailable'); };
+  assert.equal(f.runtime.connectionView().configured, false);
+  assert.equal(await f.runtime.refresh({ includeView: false }), undefined);
+  assert.equal((await f.connect()).configured, true);
+  assert.equal(await f.runtime.refresh({ includeView: false }), undefined);
+  assert.equal(f.runtime.connectionView().accountId, '123');
+  assert.equal((await f.runtime.disconnect()).configured, false);
+  assert.deepEqual(f.calls.create, []); assert.deepEqual(f.calls.cancel, []);
+});
+
+test('one display snapshot reuses its order read across a large execution history', t => {
+  const f = fixture(t), db = f.store.db;
+  f.store.transaction(() => {
+    for (let n = 0; n < 100; n++) {
+      const executionId = `history-${n}`;
+      db.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(executionId, `preview-${n}`, epoch + n, JSON.stringify({ id: executionId, kind: 'open' }));
+      for (let index = 0; index < 2; index++) {
+        const id = `${executionId}-${index}`, order = { id, executionId, index, version: 1, status: 'FILLED', quantity: '1', executedQty: '1', symbol: symbols[index] };
+        db.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?)').run(id, executionId, id, 1, 'FILLED', epoch + n, JSON.stringify(order));
+      }
+    }
+  });
+  const prepare = db.prepare.bind(db); let orderReads = 0;
+  db.prepare = sql => { if (sql === 'SELECT json FROM live_orders ORDER BY updated_at DESC') orderReads++; return prepare(sql); };
+  try {
+    const state = f.runtime.view();
+    assert.equal(state.live.executions.length, 100);
+    assert.ok(state.live.executions.every(e => e.state === 'completed' && e.legs.length === 2 && e.legs[0].index === 0));
+    assert.equal(orderReads, 1, 'each HTTP snapshot must not reread every order for every execution');
+  } finally { db.prepare = prepare; }
+});
+
 test('double confirmation is idempotent and each complete fill precedes the next leg', async t => {
   const f = fixture(t); await f.connect(); const preview = await f.preview();
   const [a, b] = await Promise.all([f.confirm(preview), f.confirm(preview)]);

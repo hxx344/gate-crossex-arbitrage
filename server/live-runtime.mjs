@@ -72,8 +72,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     db.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at,json=excluded.json')
       .run(order.id, order.executionId, order.text, order.version, order.status, order.updatedAt, JSON.stringify(order));
   }
-  function executionView(execution) {
-    const legs = orderRecords().filter(o => o.executionId === execution.id).sort((a, b) => a.index - b.index);
+  function executionView(execution, executionOrders) {
+    const legs = (executionOrders ?? orderRecords().filter(o => o.executionId === execution.id)).toSorted((a, b) => a.index - b.index);
     const unknown = legs.some(o => ['UNKNOWN', 'SENDING', 'INVALID', 'CANCEL_PENDING'].includes(o.status));
     const anyFill = legs.some(o => D(o.executedQty).gt(0));
     const allFilled = legs.length > 0 && legs.every(o => o.status === 'FILLED');
@@ -251,7 +251,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   async function refreshInternal({ deadline = Infinity, reconcile = true, includeView = true } = {}) {
     assertOwner();
-    const record = connectionRecord(); if (!record?.enabled) return view();
+    const record = connectionRecord(); if (!record?.enabled) return includeView ? view() : undefined;
     const client = getClient(record), previous = cacheRecord(), readStartedAt = clock();
     try {
       const [account, positions, openOrders] = await Promise.all([
@@ -275,7 +275,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!object(input) || typeof input.apiKey !== 'string' || typeof input.apiSecret !== 'string' || !input.apiKey.trim() || !input.apiSecret.trim() || input.apiKey.length > 1024 || input.apiSecret.length > 2048) throw credentialError();
     if (input.exchangeType !== undefined && (typeof input.exchangeType !== 'string' || !/^[A-Z][A-Z0-9_]{0,31}$/.test(input.exchangeType))) fail('交易所类型格式无效', 400);
     const previous = connectionRecord();
-    if (previous?.enabled) await refreshInternal();
+    if (previous?.enabled) await refreshInternal({ includeView: false });
     if (activeOrders().length || cacheRecord().openOrders?.some(o => !TERMINAL.has(o.state))) fail('仍有活动或未知订单，不能更换凭据或账户');
     if (previous?.enabled && cacheRecord().error) fail('原账户状态未核实，不能更换凭据或账户');
     const candidate = clientFactory({ apiKey: input.apiKey.trim(), apiSecret: input.apiSecret.trim(), clock });
@@ -298,21 +298,21 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const record = { enabled: true, version: (previous?.version || 0) + 1, accountUid, accountReference: hash(input.apiKey.trim()), keySuffix: input.apiKey.trim().slice(-4),
       apiKey: store.encrypt(input.apiKey.trim()), apiSecret: store.encrypt(input.apiSecret.trim()), exchangeType, verifiedAt: clock(), tradePermission: 'unknown' };
     store.transaction(() => { putSingleton('live_connection', record); putSingleton('live_cache', { account, positions, openOrders, version: record.version, asOf: readStartedAt, error: null }); });
-    privateClient = candidate; clientVersion = record.version; supplementalAttempt = -Infinity; void refreshSupplemental(); return view().live.connection;
+    privateClient = candidate; clientVersion = record.version; supplementalAttempt = -Infinity; void refreshSupplemental(); return connectionView();
   }
   function disconnectInternal() {
     assertOwner();
     if (activeOrders().length || cacheRecord().openOrders?.some(o => !TERMINAL.has(o.state))) fail('仍有活动或未知订单，请先核实订单后断开');
     const record = connectionRecord();
     if (record) putSingleton('live_connection', { ...record, enabled: false, apiKey: null, apiSecret: null, version: record.version + 1 });
-    privateClient = null; clientVersion = null; return view().live.connection;
+    privateClient = null; clientVersion = null; return connectionView();
   }
   async function validateLimits(plan, cache) {
     if (plan.kind !== 'open') return;
     const held = cache.positions.filter(p => !D(p.position_qty).isZero());
     if (Number.isFinite(plan.limits?.maxOpen) && held.length + plan.legs.length > plan.limits.maxOpen * 2) fail('实际持仓数量已达到上限');
     let total = market.positionsNotional ? D(await market.positionsNotional(held)) : D(0);
-    const fx = market.view().fx || [];
+    const fx = market.view({ includeOpportunities: false }).fx || [];
     for (const p of market.positionsNotional ? [] : held) {
       const quote = p.symbol.split('_').at(-1), price = p.mark_price;
       if (!positive(price)) fail('现有持仓缺少有效标记价，无法验证总名义额上限');
@@ -398,7 +398,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   async function previewInternal(input) {
     assertOwner();
     if (!object(input) || !['open', 'close'].includes(input.kind)) fail('预览类型无效', 400);
-    await refreshInternal();
+    await refreshInternal({ includeView: false });
     const { record, cache } = freshCache();
     let plan;
     const selected = [];
@@ -531,7 +531,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     assertOwner();
     const requestId = requestKey(input?.requestId), orderId = String(input?.orderId || ''), fingerprint = hash(['cancel', orderId]);
     const previous = savedRequest(requestId, fingerprint); if (previous) return previous;
-    await refreshInternal();
+    await refreshInternal({ includeView: false });
     const { record, cache } = freshCache();
     let order = findOrder(orderId);
     if (!order) {
@@ -572,7 +572,14 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       reduceOnly: external ? String(order.reduce_only) === 'true' : order.reduceOnly,
       canCancel: !!(external ? order.order_id : order.orderId) && ACTIVE.has(external ? order.state : order.status), external };
   }
-  function view() {
+  function connectionView(record = connectionRecord(), cache = cacheRecord()) {
+    const connected = !!record?.enabled;
+    return { configured: connected, connected, status: !connected ? 'disconnected' : cache.error ? 'error' : 'connected', accountId: record?.accountUid ?? null,
+      keySuffix: record?.keySuffix ?? null, apiKeySuffix: record?.keySuffix ?? null, version: record?.version ?? 0,
+      positionMode: cache.account?.position_mode ?? null, permissions: { read: connected ? 'verified' : 'unknown', trade: record?.tradePermission || 'unknown' },
+      lastVerifiedAt: record?.verifiedAt ?? null, error: cache.error };
+  }
+  function view(options) {
     const record = connectionRecord(), cache = cacheRecord(), tracked = orderRecords(), details = supplementalRecord(record?.version);
     const current = tracked.filter(o => o.version === record?.version), unknown = current.some(o => ['SENDING', 'UNKNOWN', 'INVALID', 'CANCEL_PENDING'].includes(o.status)) || cache.openOrders.some(o => !REMOTE.has(o.state));
     const stale = !cache.asOf || clock() - cache.asOf > freshnessMs || cache.asOf > clock() + 1000;
@@ -587,11 +594,13 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (record?.tradePermission === 'denied') reasons.push('此凭据只有读取权限');
     if (!owns()) reasons.push('本实例未持有执行锁');
     const externalOrders = cache.openOrders.filter(raw => !current.some(o => o.orderId === String(raw.order_id) || o.text === raw.text));
-    return { ...market.view(), mode: 'live', live: {
-      connection: { configured: connected, connected, status: !connected ? 'disconnected' : cache.error ? 'error' : 'connected', accountId: record?.accountUid ?? null,
-        keySuffix: record?.keySuffix ?? null, apiKeySuffix: record?.keySuffix ?? null, version: record?.version ?? 0,
-        positionMode: cache.account?.position_mode ?? null, permissions: { read: connected ? 'verified' : 'unknown', trade: record?.tradePermission || 'unknown' },
-        lastVerifiedAt: record?.verifiedAt ?? null, error: cache.error },
+    const byExecution = new Map();
+    for (const order of tracked) {
+      if (!byExecution.has(order.executionId)) byExecution.set(order.executionId, []);
+      byExecution.get(order.executionId).push(order);
+    }
+    return { ...market.view(options), mode: 'live', live: {
+      connection: connectionView(record, cache),
       status: freshnessState, freshnessState, stale, partial, asOf: cache.asOf, tradingAllowed: connected && !stale && !partial && knownMode && record?.tradePermission !== 'denied' && owns(), reasons,
       account: cache.account, balances: Array.isArray(cache.account?.assets) ? cache.account.assets : [],
       positions: cache.positions.filter(p => !D(p.position_qty).isZero()).map(p => positionView(p, cache.asOf, details.adl || [])),
@@ -599,7 +608,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       recentTrades: historyRows('live_trades', record?.version), recentTradesAsOf: details.recentTradesAsOf ?? null, recentTradesError: details.recentTradesError ?? null,
       accountBook: historyRows('live_account_book', record?.version), accountBookAsOf: details.accountBookAsOf ?? null, accountBookError: details.accountBookError ?? null,
       fees: details.fees || [], feesAsOf: details.feesAsOf ?? null, feesError: details.feesError ?? null, adlAsOf: details.adlAsOf ?? null, adlError: details.adlError ?? null,
-      executions: executionRecords().map(executionView), alerts: reasons, updatedAt: clock() } };
+      executions: executionRecords().map(execution => executionView(execution, byExecution.get(execution.id) || [])), alerts: reasons, updatedAt: clock() } };
   }
   function summary() {
     const record = connectionRecord(), cache = cacheRecord(), connected = !!record?.enabled;
@@ -636,7 +645,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return { requestId, requestStatus: 'not_submitted' };
   }
   return { connection: input => exclusive(() => connectInternal(input)), disconnect: () => exclusive(disconnectInternal),
-    refresh: () => exclusive(refreshInternal), preview: input => exclusive(() => previewInternal(input)), confirm: input => manualAction(input, confirmInternal),
-    cancel: input => manualAction(input, cancelInternal), requestStatus: requestId => exclusive(() => requestStatusInternal(requestId)), refreshDetails: () => refreshSupplemental(true), view, summary,
+    refresh: options => exclusive(() => refreshInternal(options)), preview: input => exclusive(() => previewInternal(input)), confirm: input => manualAction(input, confirmInternal),
+    cancel: input => manualAction(input, cancelInternal), requestStatus: requestId => exclusive(() => requestStatusInternal(requestId)), refreshDetails: () => refreshSupplemental(true), view, connectionView, summary,
     async stop() { clearInterval(heartbeat); await queue; stopped = true; await supplementalFlight; db.prepare('DELETE FROM live_owner WHERE singleton=1 AND owner=?').run(owner); } };
 }

@@ -1,17 +1,40 @@
 import { useEffect, useState } from 'react';
 import type { Instrument, MarketData } from './live-types';
+import { createLatestRead } from './latest-read';
+import { CATALOG_CACHE_MS, createTimedCache, readRetryDelay } from './live-loading';
+
+const instrumentCache = createTimedCache<Instrument[]>(CATALOG_CACHE_MS);
 
 export function useInstruments(active: boolean) {
-  const [items, setItems] = useState<Instrument[]>([]), [error, setError] = useState('');
+  const [items, setItems] = useState<Instrument[]>(() => instrumentCache.peek().value || []), [error, setError] = useState('');
   useEffect(() => {
     if (!active) return;
-    const abort = new AbortController();
-    void fetch('/api/live/instruments', { signal: abort.signal, cache: 'no-store' }).then(async response => {
-      const data = await response.json(); if (!response.ok) throw new Error(data.error || '合约目录暂不可用');
-      if (!Array.isArray(data.items)) throw new Error('合约目录格式不可用');
-      setItems(data.items); setError('');
-    }).catch(cause => { if (!abort.signal.aborted) setError(cause instanceof Error ? cause.message : '合约目录读取失败'); });
-    return () => abort.abort();
+    let disposed = false, epoch = 0, failures = 0, timer: ReturnType<typeof setTimeout> | undefined;
+    const reader = createLatestRead<Instrument[]>({
+      canRead: () => !disposed && !document.hidden,
+      load: async signal => {
+        const response = await fetch('/api/live/instruments', { signal, cache: 'no-store' });
+        const data = await response.json(); if (!response.ok) throw new Error(data.error || '合约目录暂不可用');
+        if (!Array.isArray(data.items)) throw new Error('合约目录格式不可用');
+        return data.items;
+      },
+      onData: next => { instrumentCache.put(next); failures = 0; setItems(next); setError(''); },
+      onError: cause => { failures++; setError(cause instanceof Error && cause.name !== 'TimeoutError' ? cause.message : '合约目录读取超时，稍后自动重试'); },
+    });
+    const synchronize = () => {
+      const version = ++epoch; clearTimeout(timer); reader.cancel();
+      if (document.hidden || disposed) return;
+      const poll = async () => {
+        if (version !== epoch || disposed) return;
+        const cached = instrumentCache.peek();
+        if (cached.fresh && cached.value) { setItems(cached.value); setError(''); }
+        else await reader.refresh();
+        if (version === epoch && !disposed) timer = setTimeout(poll, failures ? readRetryDelay(failures) : Math.max(1000, instrumentCache.peek().remaining));
+      };
+      void poll();
+    };
+    synchronize(); document.addEventListener('visibilitychange', synchronize);
+    return () => { disposed = true; epoch++; clearTimeout(timer); reader.cancel(); document.removeEventListener('visibilitychange', synchronize); };
   }, [active]);
   return { items, error };
 }

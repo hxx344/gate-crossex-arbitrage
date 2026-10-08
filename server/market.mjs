@@ -10,6 +10,49 @@ const safeMessage = error => error instanceof AppError ? error.message : '行情
 const positiveDecimal = value => { try { return typeof value === 'string' && value.trim() !== '' && D(value).gt(0); } catch { return false; } };
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const gcd = (a, b) => { while (b) [a, b] = [b, a % b]; return a; };
+const catalogKey = (symbol, exchange, business) => JSON.stringify([symbol, exchange, business]);
+const signalKey = (signal, declared = false) => JSON.stringify([declared ? signal.pairKey : pairKey(signal), contractIdentity(signal.long), contractIdentity(signal.short)]);
+
+function indexCatalog(items) {
+  // Preserve catalogRule's first exact match, including a suspended duplicate.
+  // Malformed legacy catalogs retain the existing validation path.
+  if (!Array.isArray(items) || items.some(row => !row || typeof row !== 'object')) return null;
+  const rules = new Map();
+  for (const row of items) {
+    const key = catalogKey(row.symbol, row.exchange_type, row.business_type);
+    if (!rules.has(key)) rules.set(key, row);
+  }
+  return rules;
+}
+function indexFeed(snapshot) {
+  const quotes = new Map(), signals = new Map(), venues = new Map(), counts = new Map(), liveVenues = new Set(), times = [], freshTimes = [];
+  for (const venue of snapshot?.exchanges || []) {
+    if (!venues.has(venue.id)) venues.set(venue.id, venue.status);
+    if (venue.status === 'live') liveVenues.add(venue.id);
+  }
+  for (const quote of snapshot?.quotes || []) {
+    quotes.set(quoteKey(quote), { quote, identity: contractIdentity(quote) });
+    counts.set(quote.exchange, (counts.get(quote.exchange) || 0) + 1);
+    const at = quoteTime(quote);
+    if (Number.isFinite(at) && at > 0) {
+      times.push(at);
+      // Cache only structural validity. The current time window is checked on
+      // every view, including when no new snapshot arrives or the clock moves.
+      if (liveVenues.has(quote.exchange) && freshQuote(quote, at)) freshTimes.push(at);
+    }
+  }
+  for (const signal of snapshot?.signals || []) if (signal?.long && signal?.short) {
+    const key = signalKey(signal, true);
+    if (!signals.has(key)) signals.set(key, signal);
+  }
+  times.sort((a, b) => a - b); freshTimes.sort((a, b) => a - b);
+  return { quotes, signals, venues, counts, times, freshTimes };
+}
+function latestAtOrBefore(times, upper) {
+  let low = 0, high = times.length;
+  while (low < high) { const mid = (low + high) >>> 1; if (times[mid] <= upper) low = mid + 1; else high = mid; }
+  return low ? times[low - 1] : null;
+}
 
 // Price limits are rounded towards the reference quote, never beyond the user's
 // adverse-price budget. These are previews, not fabricated exchange fills.
@@ -74,11 +117,22 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
   let sourceFlight = null, catalogFlight = null, generation = 0, stopping = false;
   let entryPolicyKnown = store.get('entryPolicyKnown', false);
   const recentSignals = new Map();
+  let feedIndex = indexFeed(null), catalogIndex = indexCatalog(catalog.items);
   // Keep simulation controls out of both settings and production execution.
   const config = () => { const saved = store.config(); return Object.fromEntries(CONFIG_KEYS.map(k => [k, saved[k]])); };
   const revision = () => hash([config(), store.get('liveMarketRevision', 0)]);
   const catalogAvailable = () => Array.isArray(catalog.items) && catalog.items.length > 0 && catalog.at <= clock() + 1000 && clock() - catalog.at <= 900000;
-  const sourceLive = () => !sourceError && feed && clock() - feed.generatedAt <= 10000 && feed.generatedAt <= clock() + 1000;
+  const sourceLive = (now = clock()) => !sourceError && feed && now - feed.generatedAt <= 10000 && feed.generatedAt <= now + 1000;
+  function indexedValidSignal(signal, snapshot = feed, index = feedIndex, now = clock()) {
+    const quotes = [signal?.long, signal?.short].flatMap(q => {
+      if (!q) return [];
+      const current = index.quotes.get(quoteKey(q));
+      return current?.identity === contractIdentity(q) ? [current.quote] : [];
+    });
+    // Reuse every existing identity, venue, transfer, expiry and FX check while
+    // limiting the nested quote search to the exact two current identities.
+    return validSignal(signal, { ...snapshot, quotes }, now);
+  }
   function refreshCatalog() {
     if (stopping) return Promise.resolve();
     if (catalogFlight) return catalogFlight;
@@ -88,7 +142,7 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       try {
         const items = await catalogReader();
         if (!Array.isArray(items) || !items.length || items.length > 50000) throw new AppError('CrossEx 合约目录无效');
-        if (!stopping) { catalog = { at: clock(), items }; store.set('catalog', catalog); catalogError = null; }
+        if (!stopping) { catalogIndex = indexCatalog(items); catalog = { at: clock(), items }; store.set('catalog', catalog); catalogError = null; }
       } catch (error) { if (!stopping) catalogError = safeMessage(error); }
     })().finally(() => { catalogFlight = null; });
     return catalogFlight;
@@ -101,10 +155,11 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       try {
         const next = validateFeed(await feedReader(config(), store.decrypt(store.get('monitorPassword'))), clock());
         if (stopping || current !== generation) return;
-        feed = next; sourceError = null; sourceReceivedAt = clock();
+        const nextIndex = indexFeed(next);
+        feed = next; feedIndex = nextIndex; sourceError = null; sourceReceivedAt = clock();
         if (next.crossexFilter !== undefined && !entryPolicyKnown) { entryPolicyKnown = true; store.set('entryPolicyKnown', true); }
         for (const [id, s] of recentSignals) if (s.expiresAt <= clock()) recentSignals.delete(id);
-        for (const s of next.signals) if (validSignal(s, next, clock())) recentSignals.set(s.id, s);
+        for (const s of next.signals) if (indexedValidSignal(s, next, nextIndex)) recentSignals.set(s.id, s);
         while (recentSignals.size > 800) recentSignals.delete(recentSignals.keys().next().value);
       } catch (error) { if (!stopping && current === generation) sourceError = safeMessage(error); }
       finally { if (!stopping && current === generation) sourceDurationMs = Math.max(0, clock() - started); }
@@ -112,21 +167,24 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     return sourceFlight;
   }
   async function refresh() { await Promise.all([refreshCatalog(), refreshSource()]); }
-  function eligibility(signal, original = true) {
-    let transfer = transferEligibility(signal, feed, clock());
-    if (!sourceLive()) return { transfer, reason: sourceError || '价差数据已过期' };
+  function eligibility(signal, original = true, now = clock()) {
+    let transfer = transferEligibility(signal, feed, now);
+    if (!sourceLive(now)) return { transfer, reason: sourceError || '价差数据已过期' };
     if (entryPolicyKnown && feed.crossexFilter === undefined) return { transfer: { ...transfer, state: 'blocked' }, reason: 'Monitor 筛选策略缺失，请等待来源恢复' };
     if (original && transfer.state === 'blocked') return { transfer, reason: transfer.reason };
-    const latest = feed.signals.find(s => s.pairKey === pairKey(signal) && contractIdentity(s.long) === contractIdentity(signal.long) && contractIdentity(s.short) === contractIdentity(signal.short));
+    const latest = feedIndex.signals.get(signalKey(signal));
     if (!latest) return { transfer, reason: 'Monitor 已撤回或不再列出此方向的机会' };
-    transfer = transferEligibility(latest, feed, clock());
+    transfer = transferEligibility(latest, feed, now);
     if (transfer.state === 'blocked') return { transfer, reason: transfer.reason };
-    if (!validSignal(latest, feed, clock()) || original && !validSignal(signal, feed, clock())) return { transfer, reason: '报价过期、合约身份不明或双腿不同步' };
+    if (!indexedValidSignal(latest, feed, feedIndex, now) || original && !indexedValidSignal(signal, feed, feedIndex, now)) return { transfer, reason: '报价过期、合约身份不明或双腿不同步' };
     return { transfer, reason: '', latest };
   }
   function ruleFor(q) {
     if (!catalogAvailable()) throw new AppError('CrossEx 合约目录未就绪或已过期');
-    const r = catalogRule(q, catalog.items);
+    const exchange = typeof q?.exchange === 'string' ? q.exchange.toUpperCase() : null;
+    const symbol = q?.crossexSymbol ?? (exchange ? `${exchange}_FUTURE_${q.base}_USDT` : null);
+    const match = catalogIndex?.get(catalogKey(symbol, exchange, 'FUTURE'));
+    const r = catalogRule(q, catalogIndex ? match ? [match] : [] : catalog.items);
     // Older directory fixtures omit this new LIMIT-specific bound; production
     // must explicitly supply null when the exchange does not publish a maximum.
     if (r.max_limit_size !== null && !positiveDecimal(r.max_limit_size)) throw new AppError(`${r.symbol} 缺少有效的最大限价数量规则`);
@@ -151,18 +209,18 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       return { ...signal, transfer: entry.transfer, grossBps, netBps, feeSnapshot: fees, eligible: !reason, reason, warnings };
     }).sort((a, b) => Number(b.eligible) - Number(a.eligible) || (b.netBps ?? -Infinity) - (a.netBps ?? -Infinity));
   }
-  function view() {
-    const quotes = feed?.quotes || [], sourceTimes = quotes.map(quoteTime).filter(at => Number.isFinite(at) && at > 0 && at <= clock() + 1000);
-    const hasFresh = quotes.some(q => freshQuote(q, clock()) && feed.exchanges.some(x => x.id === q.exchange && x.status === 'live'));
-    return { now: clock(), config: { ...config(), hasMonitorPassword: !!store.get('monitorPassword') },
-      source: { state: sourceLive() && hasFresh ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError,
+  function view({ includeOpportunities = true } = {}) {
+    const now = clock(), live = sourceLive(now), latestFresh = latestAtOrBefore(feedIndex.freshTimes, now + 1000);
+    const hasFresh = latestFresh !== null && now - latestFresh <= 10000;
+    return { now, config: { ...config(), hasMonitorPassword: !!store.get('monitorPassword') },
+      source: { state: live && hasFresh ? feed.status : sourceError ? 'offline' : 'stale', error: sourceError,
         checkedAt: sourceCheckedAt, receivedAt: sourceReceivedAt, durationMs: sourceDurationMs, generatedAt: feed?.generatedAt ?? null,
-        updatedAt: sourceTimes.length ? Math.max(...sourceTimes) : null, quoteCount: quotes.length,
+        updatedAt: latestAtOrBefore(feedIndex.times, now + 1000), quoteCount: feed?.quotes.length || 0,
         entryPolicy: feed?.crossexFilter ? { ...feed.crossexFilter } : null },
       catalog: { state: catalogAvailable() ? catalogError ? 'cached' : 'live' : 'unavailable', updatedAt: catalog.at || null, count: catalog.items.length, error: catalogError },
-      venues: SUPPORTED_VENUES.map(id => ({ id, state: sourceLive() ? feed.exchanges.find(x => x.id === id)?.status ?? 'unavailable' : 'offline', quoteCount: quotes.filter(q => q.exchange === id).length })),
+      venues: SUPPORTED_VENUES.map(id => ({ id, state: live ? feedIndex.venues.get(id) ?? 'unavailable' : 'offline', quoteCount: feedIndex.counts.get(id) || 0 })),
       fx: ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (e) { return { currency, state: 'unavailable', error: safeMessage(e) }; } }),
-      opportunities: candidates() };
+      opportunities: includeOpportunities ? candidates() : [] };
   }
   async function booksAndFx(quotes, requireFx = true) {
     const [books, fx] = await Promise.all([
@@ -371,10 +429,10 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       store.set('liveMarketRevision', store.get('liveMarketRevision', 0) + 1);
     });
     if (changed || input.clearMonitorPassword || input.monitorPassword) {
-      generation++; feed = null; recentSignals.clear(); sourceCheckedAt = sourceReceivedAt = sourceDurationMs = null;
+      generation++; feed = null; feedIndex = indexFeed(null); recentSignals.clear(); sourceCheckedAt = sourceReceivedAt = sourceDurationMs = null;
       entryPolicyKnown = false; store.set('entryPolicyKnown', false); sourceError = '连接设置已更改，等待重新读取';
     }
-    return view();
+    return view({ includeOpportunities: false });
   }
   return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, previewDirect, previewPair, previewOpen, revalidateOpen, previewClose, revalidateClose, positionsNotional, settings,
     async stop() { stopping = true; await Promise.all([sourceFlight, catalogFlight]); } };

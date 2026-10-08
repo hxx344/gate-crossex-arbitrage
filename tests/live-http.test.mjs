@@ -39,6 +39,39 @@ test('real HTTP protects manual writes with Basic auth, same origin and CSRF', a
   assert.ok(f.calls.every(call => call.signatureVerified || call.public));
 });
 
+test('account bootstrap stays usable when full state fails and never exposes credentials', async t => {
+  const f = await fixture(t);
+  const original = f.app.market.view;
+  f.app.market.view = () => { throw new Error('Unrelated full market state unavailable'); };
+  assert.equal((await f.request('/api/state')).status, 500);
+  assert.equal((await f.request('/api/bootstrap', { auth: false })).status, 401);
+  const initial = await f.request('/api/bootstrap');
+  assert.equal(initial.status, 200); assert.equal(initial.data.connection.configured, false);
+  assert.equal(initial.data.config.notionalPerLeg, 100); assert.ok(initial.data.csrfToken);
+  assert.equal(initial.headers.get('cache-control'), 'no-store'); assert.equal(f.calls.length, 0);
+  assert.equal((await f.request('/api/live/connection', { method: 'PUT', csrf: false, body: f.credentials })).status, 403);
+  assert.equal((await f.request('/api/live/connection', { method: 'PUT', headers: { Origin: 'https://other.invalid' }, body: f.credentials })).status, 403);
+  await connect(f);
+  const connected = await f.request('/api/bootstrap');
+  assert.equal(connected.status, 200); assert.equal(connected.data.connection.accountId, '12345');
+  assert.equal(connected.data.connection.configured, true);
+  assert.ok(!JSON.stringify(connected.data).includes(f.credentials.apiKey));
+  assert.ok(!JSON.stringify(connected.data).includes(f.credentials.apiSecret));
+  assert.equal((await f.request('/api/live/connection', { method: 'DELETE', body: {} })).status, 200);
+  assert.equal((await f.request('/api/bootstrap')).data.connection.configured, false);
+  assert.equal(writes(f).length, 0);
+  f.app.market.view = original;
+});
+
+test('light state omits opportunity work without losing the live account or fresh source', async t => {
+  const f = await fixture(t);
+  const full = await f.request('/api/state'), light = await f.request('/api/state?opportunities=0');
+  assert.equal(full.data.opportunities.length, 1); assert.deepEqual(light.data.opportunities, []);
+  assert.deepEqual(light.data.live.connection, full.data.live.connection);
+  assert.equal(light.data.source.updatedAt, full.data.source.updatedAt);
+  assert.deepEqual(light.data.config, full.data.config); assert.equal(light.data.csrfToken, full.data.csrfToken);
+});
+
 test('real HTTP preview is read-only, ACKs are polled, duplicate confirmation never writes twice, partial close uses reduce_only', async t => {
   const f = await fixture(t); await connect(f);
   const plan = await preview(f);

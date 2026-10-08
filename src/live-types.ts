@@ -45,6 +45,7 @@ export type LiveView = {
 export type LiveState = Pick<State, 'now' | 'csrfToken' | 'venues' | 'fx' | 'source' | 'catalog' | 'opportunities'> & {
   mode: 'live'; config: LiveConfig; live: LiveView;
 };
+export type LiveBootstrap = { now: number; config: LiveConfig; connection: LiveView['connection']; csrfToken: string };
 
 export type CloseLeg = { positionId: string; quantity?: string; positionSide?: 'LONG' | 'SHORT' };
 export type PreviewInput = { kind: 'open'; signalId: string }

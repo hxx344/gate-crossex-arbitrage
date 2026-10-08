@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { createStore } from '../server/store.mjs';
 import { createMarket } from '../server/market.mjs';
 import { feed, quote, book, catalog, epoch } from './fixtures.mjs';
+import { largeMarketData, memoryMarketStore } from './live-market-performance-fixture.mjs';
 
 function fixture(t, options = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'crossex-live-market-'));
@@ -156,4 +157,114 @@ test('confirmation rechecks FX against the exact previewed USDT valuation', asyn
   await assert.rejects(f.market.revalidateOpen(plan), /提高订单估值/);
   rate = 0.99;
   await f.market.revalidateOpen(plan);
+});
+
+test('large market snapshots keep refresh and views bounded and lightweight reads skip candidate work', async t => {
+  const data = largeMarketData({ instrument: true });
+  const market = createMarket(memoryMarketStore(), { clock: () => epoch, feedReader: async () => data.snapshot, catalogReader: async () => data.catalog });
+  t.after(() => market.stop()); data.resetReads();
+  await market.refresh();
+  assert.ok(data.reads.quoteSymbols < data.snapshot.quotes.length * 12 + data.snapshot.signals.length * 100, 'refresh must not scan the quote directory separately for each signal');
+  data.resetReads(); const full = market.view();
+  assert.equal(full.opportunities.length, 200); assert.equal(full.opportunities.filter(s => s.eligible).length, 100);
+  assert.ok(data.reads.quoteSymbols < 40000, 'a full view must not repeatedly traverse all 5000 quotes');
+  assert.ok(data.reads.catalogSymbols < 10000, 'a full view must not scan the entire directory for each leg');
+  assert.ok(data.reads.signalLegs < 20000, 'candidate identity lookup must not rescan all other signals');
+  data.resetReads(); const light = market.view({ includeOpportunities: false });
+  assert.deepEqual(data.reads, { quoteSymbols: 0, catalogSymbols: 0, signalLegs: 0 });
+  assert.deepEqual({ ...light, opportunities: full.opportunities }, full);
+  assert.equal(light.source.quoteCount, 5000); assert.equal(light.venues.find(v => v.id === 'binance').quoteCount, 2500);
+  assert.ok(Buffer.byteLength(JSON.stringify(light)) < 2000);
+});
+
+test('new snapshots replace exact quote identities, venue status and withdrawn signals immediately', async t => {
+  const f = fixture(t); await f.market.refresh(); assert.equal(f.market.view().opportunities[0].eligible, true);
+  for (const alter of [
+    next => { next.quotes[0] = { ...next.quotes[0], settlementCurrency: 'USDC' }; },
+    next => { next.quotes[0] = { ...next.quotes[0], delisting: true }; },
+    next => { next.quotes[0] = { ...next.quotes[0], bidAskAt: epoch - 10001 }; },
+    next => { next.exchanges[0] = { ...next.exchanges[0], status: 'offline' }; },
+  ]) {
+    const next = feed(epoch); alter(next); f.setFeed(next); await f.market.refreshSource();
+    assert.equal(f.market.view().opportunities[0].eligible, false);
+    f.setFeed(feed(epoch)); await f.market.refreshSource(); assert.equal(f.market.view().opportunities[0].eligible, true);
+  }
+  f.setFeed({ ...feed(epoch), signals: [] }); await f.market.refreshSource();
+  assert.deepEqual(f.market.view().opportunities, []);
+  await assert.rejects(f.market.previewOpen(`signal-${epoch}`), /撤回/);
+});
+
+test('indexed eligibility preserves the first signal with the exact declared pair and identities', async t => {
+  const f = fixture(t), next = feed(epoch), valid = next.signals[0];
+  next.signals = [{ ...valid, id: 'expired-first', expiresAt: epoch }, valid];
+  f.setFeed(next); await f.market.refresh();
+  assert.ok(f.market.view().opportunities.every(s => !s.eligible));
+  await assert.rejects(f.market.previewOpen(valid.id), /过期/);
+  const mismatched = { ...next, signals: [{ ...valid, id: 'wrong-declared-pair', pairKey: 'not-the-pair', expiresAt: epoch }, valid] };
+  f.setFeed(mismatched); await f.market.refreshSource();
+  assert.equal(f.market.view().opportunities.find(s => s.id === valid.id).eligible, true);
+});
+
+test('cached identities never cache away transfer expiry or current freshness windows', async t => {
+  const f = fixture(t), next = feed(epoch);
+  next.crossexFilter = { requireSpotTransfer: true, blockedBases: [], revision: 1 };
+  next.signals[0] = { ...next.signals[0], expiresAt: epoch + 500, spotTransfer: { networks: ['ETH'], checkedAt: epoch, expiresAt: epoch + 500 } };
+  f.setFeed(next); await f.market.refresh();
+  assert.equal(f.market.view().opportunities[0].eligible, true);
+  f.advance(500);
+  assert.equal(f.market.view({ includeOpportunities: false }).source.state, 'live');
+  assert.equal(f.market.view().opportunities[0].eligible, false);
+  assert.match(f.market.view().opportunities[0].reason, /过期/);
+  f.advance(10001);
+  assert.equal(f.market.view({ includeOpportunities: false }).source.state, 'stale');
+  assert.equal(f.market.view({ includeOpportunities: false }).source.updatedAt, epoch);
+});
+
+test('source summary re-evaluates future timestamp bounds without another refresh', async t => {
+  const f = fixture(t), next = feed(epoch);
+  next.quotes = next.quotes.map(q => ({ ...q, bidAskAt: epoch + 2000, receivedAt: epoch + 2000 }));
+  next.signals = []; f.setFeed(next); await f.market.refresh();
+  const early = f.market.view({ includeOpportunities: false });
+  assert.equal(early.source.updatedAt, null); assert.equal(early.source.state, 'stale');
+  f.advance(1000);
+  const current = f.market.view({ includeOpportunities: false });
+  assert.equal(current.source.updatedAt, epoch + 2000); assert.equal(current.source.state, 'live');
+});
+
+test('catalog indices refresh exact venue keys and retain first duplicate validation', async t => {
+  const f = fixture(t), rules = catalog.map(r => ({ ...r, max_limit_size: '10000' }));
+  f.setRules([{ ...rules[0], exchange_type: 'BYBIT', state: 'suspend' }, ...rules]); await f.market.refresh();
+  assert.equal(f.market.view().opportunities[0].eligible, true, 'another venue with the same symbol cannot shadow the exact rule');
+  f.advance(300000); f.setRules([{ ...rules[0], state: 'suspend' }, ...rules]); await f.market.refresh();
+  assert.equal(f.market.view().opportunities[0].eligible, false);
+  assert.match(f.market.view().opportunities[0].reason, /未在 CrossEx/);
+  f.advance(300000); f.setRules(rules); await f.market.refresh();
+  assert.equal(f.market.view().opportunities[0].eligible, true);
+  f.advance(300000); f.setRules(rules.map(r => ({ ...r, tick_size: '0.1' }))); await f.market.refresh();
+  await assert.rejects(f.market.previewDirect({ symbol: rules[0].symbol, side: 'BUY', quantity: '0.1', price: '98.01', orderType: 'LIMIT', timeInForce: 'GTC' }), /精度/);
+});
+
+test('persisted catalogs are indexed before the first refresh and still expire', async t => {
+  let now = epoch, reads = 0;
+  const market = createMarket(memoryMarketStore({ catalog: { at: epoch, items: catalog.map(r => ({ ...r, max_limit_size: '10000' })) } }), {
+    clock: () => now, feedReader: async () => feed(now), catalogReader: async () => { reads++; throw new Error('offline'); },
+  });
+  t.after(() => market.stop()); await market.refresh();
+  assert.equal(reads, 0); assert.equal(market.view().opportunities[0].eligible, true);
+  now += 900001; await market.refresh();
+  assert.equal(reads, 1); assert.equal(market.view().catalog.state, 'unavailable'); assert.equal(market.view().opportunities[0].eligible, false);
+});
+
+test('configuration changes affect candidate decisions immediately and connection changes clear source metadata', async t => {
+  const f = fixture(t); await f.market.refresh();
+  const saved = f.market.settings({ config: { entryPaused: true } });
+  assert.deepEqual(saved.opportunities, []); assert.equal(saved.config.entryPaused, true); assert.equal(saved.source.quoteCount, 2);
+  assert.equal(f.market.view().opportunities[0].eligible, false); assert.match(f.market.view().opportunities[0].reason, /暂停/);
+  f.market.settings({ config: { entryPaused: false, minNetBps: 5000 } });
+  assert.equal(f.market.view().opportunities[0].eligible, false); assert.match(f.market.view().opportunities[0].reason, /门槛/);
+  f.market.settings({ config: { minNetBps: 20 } }); assert.equal(f.market.view().opportunities[0].eligible, true);
+  const disconnected = f.market.settings({ config: { monitorUsername: 'changed' } });
+  assert.equal(disconnected.source.quoteCount, 0); assert.equal(disconnected.source.updatedAt, null); assert.equal(disconnected.source.state, 'offline');
+  assert.ok(disconnected.venues.every(v => v.quoteCount === 0)); assert.deepEqual(f.market.view().opportunities, []);
+  await f.market.refreshSource(); assert.equal(f.market.view().opportunities[0].eligible, true);
 });
