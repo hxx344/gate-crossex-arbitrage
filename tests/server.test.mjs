@@ -23,18 +23,19 @@ async function fixture(t) {
   return { app, directory, request, origin };
 }
 test('health is public; state and summaries require module authentication', async t => {
-  const f = await fixture(t); assert.equal((await f.request('/api/health', { auth: false })).data.liveTradingAvailable, false);
+  const f = await fixture(t); assert.equal((await f.request('/api/health', { auth: false })).data.liveTradingAvailable, true);
   for (const path of ['/api/state', '/api/hub/summary']) assert.equal((await f.request(path, { auth: false })).status, 401);
   assert.equal((await f.request('/api/state')).status, 200);
 });
-test('writes require same-origin JSON and csrf; no real execution endpoint exists', async t => {
+test('writes require same-origin JSON and csrf; automation settings are rejected', async t => {
   const f = await fixture(t); await f.request('/api/state');
-  const body = { config: { enabled: true } };
+  const body = { config: { entryPaused: true } };
   assert.equal((await f.request('/api/settings', { method: 'PUT', body, originHeader: 'https://evil.example' })).status, 403);
   assert.equal((await f.request('/api/settings', { method: 'PUT', body, originHeader: '' })).status, 403);
   assert.equal((await f.request('/api/settings', { method: 'PUT', body, csrfHeader: '' })).status, 403);
   assert.equal((await f.request('/api/settings', { method: 'PUT', body, headers: { 'Content-Type': 'text/plain' } })).status, 415);
   assert.equal((await f.request('/api/settings', { method: 'PUT', body })).status, 200);
+  assert.equal((await f.request('/api/settings', { method: 'PUT', body: { config: { enabled: true } } })).status, 400);
   assert.equal((await f.request('/api/live/orders', { method: 'POST', body: {} })).status, 404);
 });
 test('summary never marks absent data fresh, secrets never enter public state or plaintext DB', async t => {
@@ -42,16 +43,18 @@ test('summary never marks absent data fresh, secrets never enter public state or
   await f.request('/api/state'); await f.request('/api/settings', { method: 'PUT', body: { config: {}, monitorPassword: 'not-a-real-monitor-secret' } });
   assert.doesNotMatch(JSON.stringify((await f.request('/api/state')).data), /not-a-real-monitor-secret/);
   assert.equal(readFileSync(join(f.directory, 'crossex.sqlite')).includes(Buffer.from('not-a-real-monitor-secret')), false);
-  await f.app.engine.tick(); const summary = (await f.request('/api/hub/summary')).data; assert.equal(summary.schemaVersion, 1); assert.deepEqual(Object.keys(summary.data).sort(), ['metrics', 'updatedAt']);
+  await f.app.market.refresh(); const summary = (await f.request('/api/hub/summary')).data; assert.equal(summary.schemaVersion, 1); assert.deepEqual(Object.keys(summary.data).sort(), ['metrics', 'updatedAt']);
 });
 test('reset revokes cached Basic authorization immediately', async t => {
   const f = await fixture(t); await f.request('/api/state'); f.app.resetPassword(); assert.equal((await f.request('/api/state')).status, 401);
 });
-test('HTTP open and close are idempotent across repeated delivery', async t => {
-  const f = await fixture(t); await f.request('/api/state'); await f.app.engine.tick();
-  const signalId = f.app.engine.view().opportunities[0].id, body = { signalId, requestId: 'http-open-test-id' };
-  const first = await f.request('/api/open', { method: 'POST', body }), second = await f.request('/api/open', { method: 'POST', body });
-  assert.equal(first.status, 200); assert.equal(first.data.id, second.data.id); assert.equal(f.app.engine.view().totals.openCount, 1);
+test('removed simulation routes cannot create or manage positions', async t => {
+  const f = await fixture(t); await f.request('/api/state'); await f.app.market.refresh();
+  for (const route of ['/api/open', '/api/close', '/api/execution']) {
+    assert.equal((await f.request(route, { method: 'POST', body: { signalId: 'legacy', requestId: 'legacy-http-request' } })).status, 410);
+  }
+  assert.equal(f.app.store.positions().length, 0); assert.equal(f.app.store.executions().length, 0);
+  assert.equal((await f.request('/api/state')).data.mode, 'live');
 });
 test('wrong-password bursts do not lock out a subsequent correct login', async t => {
   const f = await fixture(t);
@@ -65,15 +68,13 @@ test('wrong-password bursts do not lock out a subsequent correct login', async t
 });
 
 
-test('summary v2 never builds full state and history changes are conditional', async t => {
-  const f = await fixture(t); const view = f.app.engine.view;
-  f.app.engine.view = () => { throw Error('summary must not call view'); };
+test('summary v2 reports live connection without exposing archived paper history', async t => {
+  const f = await fixture(t);
   const summary = await f.request('/api/hub/summary?schemaVersion=2');
   assert.equal(summary.status, 200); assert.equal(summary.data.schemaVersion, 2); assert.equal(summary.data.data.updatedAt, null); assert.equal(summary.data.data.health.state, 'offline');
-  f.app.engine.view = view;
   const light = await f.request('/api/state?history=0'); assert.equal(light.data.history, undefined);
   const full = await f.request('/api/state');
-  const unchanged = await f.request('/api/state?historyVersion=' + encodeURIComponent(full.data.historyVersion)); assert.equal(unchanged.data.history, undefined);
+  assert.equal(full.data.mode, 'live'); assert.equal(full.data.history, undefined); assert.deepEqual(full.data.live.positions, []);
 });
 
 test('only hashed JS and CSS have immutable asset caching; HTML and APIs remain no-store', async t => {

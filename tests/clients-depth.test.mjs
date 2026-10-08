@@ -6,7 +6,7 @@ import { publicSnapshot } from '../server/public-snapshot.mjs';
 
 const NOW = 1790067200000;
 function quote(exchange, currency = 'USDT', base = 'BTC') {
-  const symbol = { binance: `${base}${currency}`, bybit: currency === 'USDC' ? `${base}PERP` : `${base}${currency}`, okx: `${base}-${currency}-SWAP`, gate: `${base}_USDT`, kraken: `PF_${base === 'BTC' ? 'XBT' : base}USD`, hyperliquid: base, lighter: base }[exchange];
+  const symbol = { binance: `${base}${currency}`, bybit: currency === 'USDC' ? `${base}PERP` : `${base}${currency}`, okx: `${base}-${currency}-SWAP`, gate: `${base}_USDT`, kraken: `PF_${base === 'BTC' ? 'XBT' : base}USD`, hyperliquid: base, lighter: base, deribit: `${base}_USDC-PERPETUAL` }[exchange];
   const settlementCurrency = exchange === 'hyperliquid' ? 'USDC' : currency;
   return { exchange, symbol, base, rawBase: base, quoteCurrency: currency, settlementCurrency, collateralCurrency: exchange === 'kraken' ? 'MULTI' : settlementCurrency, counterCurrency: settlementCurrency, contractKind: exchange === 'hyperliquid' && currency === 'USDT' ? 'quanto' : 'linear', crossexSymbol: `${exchange.toUpperCase()}_FUTURE_${base}_${settlementCurrency}`, multiplier: 1, assetClass: 'crypto', identityVerified: true, identitySource: 'official-fixture', comparable: true, ...(exchange === 'lighter' ? { marketId: 1 } : {}) };
 }
@@ -30,6 +30,7 @@ function fixture(q, overrides = {}) {
     kraken: { result: 'success', instruments: [{ symbol: q.symbol, type: 'flexible_futures', base: 'XBT', quote: 'USD', contractSize: 1, tradeable: true, postOnly: false, isExpired: false, tradfi: false }] },
     hyperliquid: { collateralToken: 0, universe: [{ name: q.symbol, szDecimals: 5, maxLeverage: 40, isDelisted: false }] },
     lighter: { code: 200, order_book_details: [{ symbol: q.symbol, market_id: 1, market_type: 'perp', multiplier: '1', status: 'active', funding_premium_multiplier: 100 }] },
+    deribit: { jsonrpc: '2.0', result: { instrument_name: q.symbol, kind: 'future', instrument_type: 'linear', future_type: 'linear', is_active: true, state: 'open', underlying_type: 'crypto', settlement_period: 'perpetual', base_currency: q.base, quote_currency: 'USDC', settlement_currency: 'USDC', contract_size: 0.0001, min_trade_amount: 0.0001, expiration_timestamp: 32503708800000 } },
   }[q.exchange];
   const depth = {
     binance: { T: NOW, ...rows },
@@ -37,6 +38,7 @@ function fixture(q, overrides = {}) {
     okx: { code: '0', data: [{ ts: String(NOW), ...rows }] },
     gate: { update: NOW / 1000, current: NOW / 1000 + 2, bids: rows.bids.map(([p, s]) => ({ p, s })), asks: rows.asks.map(([p, s]) => ({ p, s })) },
     hyperliquid: { coin: q.symbol, time: NOW, levels: [rows.bids.map(([px, sz]) => ({ px, sz })), rows.asks.map(([px, sz]) => ({ px, sz }))] },
+    deribit: { jsonrpc: '2.0', result: { instrument_name: q.symbol, state: 'open', timestamp: NOW, ...rows } },
   }[q.exchange];
   return { metadata, binance, depth, requests, fetcher: async (url, init) => {
     requests.push({ url, init });
@@ -44,12 +46,12 @@ function fixture(q, overrides = {}) {
     if (init.method === 'POST') { assert.equal(url, 'https://api.hyperliquid.xyz/info'); assert.ok(['meta', 'l2Book'].includes(JSON.parse(init.body).type)); }
     else assert.equal(init.method, 'GET');
     if (url.endsWith('/exchangeInfo') && q.exchange !== 'binance') return new Response(JSON.stringify(overrides.binance ?? binance));
-    const isMetadata = /exchangeInfo|instruments-info|public\/instruments|contracts\/|v3\/instruments|orderBookDetails/.test(url) || JSON.parse(init.body || '{}').type === 'meta';
+    const isMetadata = /exchangeInfo|instruments-info|public\/instruments|public\/get_instrument\?|contracts\/|v3\/instruments|orderBookDetails/.test(url) || JSON.parse(init.body || '{}').type === 'meta';
     return new Response(JSON.stringify(isMetadata ? overrides.metadata ?? metadata : overrides.depth ?? depth));
   } };
 }
 
-for (const [exchange, currency, expectedUnit] of [['binance', 'USDT', 1], ['binance', 'USDC', 1], ['bybit', 'USDT', 1], ['bybit', 'USDC', 1], ['okx', 'USDT', 0.01], ['okx', 'USDC', 0.01], ['gate', 'USDT', 0.0001], ['hyperliquid', 'USDT', 1]]) {
+for (const [exchange, currency, expectedUnit] of [['binance', 'USDT', 1], ['binance', 'USDC', 1], ['bybit', 'USDT', 1], ['bybit', 'USDC', 1], ['okx', 'USDT', 0.01], ['okx', 'USDC', 0.01], ['gate', 'USDT', 0.0001], ['hyperliquid', 'USDT', 1], ['deribit', 'USDC', 1]]) {
   test(`${exchange} ${currency}: official identity, source time and base quantity retain native prices`, async () => {
     const q = quote(exchange, currency), f = fixture(q), clients = createPublicClients({ fetcher: f.fetcher, clock: () => NOW + 100 });
     const book = await clients.loadDepth(q);
@@ -59,6 +61,18 @@ for (const [exchange, currency, expectedUnit] of [['binance', 'USDT', 1], ['bina
     await clients.loadDepth(q); assert.equal(f.requests.length, exchange === 'binance' ? 3 : 4, 'verified native and independent metadata are reused, every depth read remains fresh');
   });
 }
+
+test('external CrossEx positions resolve native contracts without Monitor, including Lighter market IDs', async () => {
+  for (const [exchange, currency] of [['binance', 'USDT'], ['bybit', 'USDC'], ['okx', 'USDT'], ['gate', 'USDT'], ['kraken', 'USD'], ['hyperliquid', 'USDT'], ['lighter', 'USDC'], ['deribit', 'USDC']]) {
+    const q = quote(exchange, currency), f = fixture(q), clients = createPublicClients({ fetcher: f.fetcher, clock: () => NOW });
+    const resolved = await clients.resolveCrossexQuote(q.crossexSymbol);
+    assert.equal(resolved.symbol, q.symbol); assert.equal(resolved.counterCurrency, q.counterCurrency);
+    assert.equal(resolved.settlementCurrency, q.settlementCurrency); assert.equal(resolved.marketId, q.marketId);
+  }
+  const q = quote('binance'), f = fixture(q), clients = createPublicClients({ fetcher: f.fetcher, clock: () => NOW });
+  for (const symbol of ['DERIBIT_FUTURE_BTC_USDT', 'DERIBIT_FUTURE_BTC_USD', 'BINANCE_SPOT_BTC_USDT', 'GATE_FUTURE_BTC_USDC']) await assert.rejects(clients.resolveCrossexQuote(symbol));
+  assert.equal(f.requests.length, 0);
+});
 
 test('Hyperliquid HYPE uses USDC and sends only public metadata/L2 POST bodies', async () => {
   const q = quote('hyperliquid', 'USDC', 'HYPE'), f = fixture(q), clients = createPublicClients({ fetcher: f.fetcher, clock: () => NOW });
@@ -128,7 +142,7 @@ test('fresh response time never rejuvenates an old Gate book or Lighter matching
   await assert.rejects(createPublicClients({ fetcher: lf.fetcher, clock: () => NOW, WebSocketImpl: Socket }).loadDepth(l), /过期/);
 });
 
-test('invalid symbols, multipliers and the excluded venue make no public requests', async () => {
+test('invalid symbols, multipliers and contradictory venue identity make no public requests', async () => {
   let requests = 0;
   const clients = createPublicClients({ fetcher: async () => { requests++; throw Error('unexpected'); } });
   for (const patch of [{ exchange: 'deribit' }, { multiplier: 1000 }, { symbol: 'BTCUSDT&other=1' }, { identityVerified: false }]) await assert.rejects(clients.loadDepth({ ...quote('binance'), ...patch }), /不支持/);
@@ -196,7 +210,7 @@ test('saved identity flags cannot bypass missing or newly non-crypto native clas
 });
 
 test('every non-Binance venue rechecks independent COIN evidence even without a current feed quote', async () => {
-  for (const [exchange, currency] of [['bybit', 'USDT'], ['okx', 'USDT'], ['gate', 'USDT'], ['kraken', 'USD'], ['hyperliquid', 'USDT'], ['lighter', 'USDC']]) {
+  for (const [exchange, currency] of [['bybit', 'USDT'], ['okx', 'USDT'], ['gate', 'USDT'], ['kraken', 'USD'], ['hyperliquid', 'USDT'], ['lighter', 'USDC'], ['deribit', 'USDC']]) {
     for (const change of [
       x => { x.symbols = []; },
       x => { delete x.symbols[0].underlyingType; },
@@ -252,4 +266,80 @@ test('legitimate crypto categories and independently listed native Hyperliquid a
     const q = quote('hyperliquid', 'USDC', base), f = fixture(q); f.metadata.universe[0].szDecimals = 0;
     assert.equal((await createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q)).quoteCurrency, 'USDC');
   }
+});
+
+test('Deribit linear USDC depth amounts are base coins, independent of contract size', async () => {
+  // Deribit public/get_instrument and Linear Perpetual specifications, checked 2026-10-08:
+  // https://docs.deribit.com/api-reference/market-data/public-get_instrument
+  // https://support.deribit.com/hc/en-us/articles/31424969384605-Linear-Perpetual
+  const q = quote('deribit', 'USDC'), f = fixture(q);
+  f.depth.result.bids = [[65000.1, 0.1234], [65000, 0.0001]];
+  f.depth.result.asks = [[65000.2, 0.2345], [65000.3, 0.5]];
+  const clients = createPublicClients({ fetcher: f.fetcher, clock: () => NOW + 25 });
+  const resolved = await clients.resolveCrossexQuote('DERIBIT_FUTURE_BTC_USDC');
+  const book = await clients.loadDepth(resolved);
+  assert.equal(resolved.symbol, 'BTC_USDC-PERPETUAL'); assert.equal(resolved.multiplier, 1);
+  assert.equal(book.quoteCurrency, 'USDC'); assert.equal(book.at, NOW); assert.equal(book.receivedAt, NOW + 25);
+  assert.deepEqual(book.bids, [[65000.1, 0.1234], [65000, 0.0001]]);
+  assert.deepEqual(book.asks, [[65000.2, 0.2345], [65000.3, 0.5]]);
+  assert.equal(f.requests[0].url, 'https://www.deribit.com/api/v2/public/get_instrument?instrument_name=BTC_USDC-PERPETUAL');
+  assert.equal(book.source, 'https://www.deribit.com/api/v2/public/get_order_book?instrument_name=BTC_USDC-PERPETUAL&depth=100');
+  assert.equal(f.requests.length, 3); assert.ok(f.requests.every(item => item.init.method === 'GET' && item.init.body === undefined));
+});
+
+test('Deribit documented future_type is a fallback only when instrument_type is absent', async () => {
+  const q = quote('deribit', 'USDC'), f = fixture(q); delete f.metadata.result.instrument_type;
+  assert.equal((await createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q)).symbol, q.symbol);
+  for (const row of [{ instrument_type: 'reversed', future_type: 'linear' }, { instrument_type: 'linear', future_type: 'reversed' }, { instrument_type: undefined, future_type: undefined }]) {
+    const invalid = fixture(q); Object.assign(invalid.metadata.result, row);
+    await assert.rejects(createPublicClients({ fetcher: invalid.fetcher, clock: () => NOW }).loadDepth(q), /未确认/);
+    assert.equal(invalid.requests.length, 1);
+  }
+});
+
+test('Deribit native classification, lifecycle and settlement contradictions block depth', async () => {
+  for (const changes of [
+    { underlying_type: 'equity' }, { underlying_type: 'preipo' }, { underlying_type: undefined },
+    { state: 'locked' }, { state: 'halted' }, { state: 'settlement' }, { is_active: false },
+    { kind: 'option' }, { kind: 'future_combo' }, { settlement_period: 'month' },
+    { instrument_name: 'ETH_USDC-PERPETUAL' }, { base_currency: 'ETH' }, { quote_currency: 'USD' }, { settlement_currency: 'BTC' },
+  ]) {
+    const q = quote('deribit', 'USDC'), f = fixture(q); Object.assign(f.metadata.result, changes);
+    await assert.rejects(createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q), /未确认/);
+    assert.equal(f.requests.length, 1, 'rejected metadata never reaches independent evidence or depth');
+  }
+  const q = quote('deribit', 'USDC'), f = fixture(q); f.metadata.error = { code: 11050, message: 'invalid_request' };
+  await assert.rejects(createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q), /未确认/);
+});
+
+test('Deribit book matching, lifecycle and source timestamps are required on every read', async () => {
+  for (const changes of [
+    { instrument_name: 'ETH_USDC-PERPETUAL' }, { state: 'locked' }, { state: 'halted' }, { state: 'settlement' },
+    { timestamp: NOW - 10_001 }, { timestamp: NOW + 1001 }, { timestamp: NOW / 1000 }, { timestamp: undefined },
+    { bids: [[101.1, 1]] }, { asks: [[101, 0]] },
+  ]) {
+    const q = quote('deribit', 'USDC'), f = fixture(q); Object.assign(f.depth.result, changes);
+    await assert.rejects(createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q), /无效|过期|交叉/);
+    assert.equal(f.requests.length, 3);
+  }
+  const q = quote('deribit', 'USDC'), f = fixture(q); f.depth.error = { code: 10000, message: 'authorization_required' };
+  await assert.rejects(createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).loadDepth(q), /无效/);
+});
+
+test('Deribit inverse, mismatched settlement and unverified quantity identities fail before network', async () => {
+  let requests = 0;
+  const clients = createPublicClients({ fetcher: async () => { requests++; throw Error('unexpected request'); } });
+  for (const changes of [{ symbol: 'BTC-PERPETUAL' }, { quoteCurrency: 'USD' }, { settlementCurrency: 'BTC' }, { collateralCurrency: 'BTC' }, { counterCurrency: 'USDT' }, { contractKind: 'inverse' }, { multiplier: 0.0001 }, { rawBase: '1000BTC' }, { crossexSymbol: 'DERIBIT_FUTURE_BTC_USDT' }]) {
+    await assert.rejects(clients.loadDepth({ ...quote('deribit', 'USDC'), ...changes }), /不支持/);
+  }
+  assert.equal(requests, 0);
+});
+
+test('Deribit native crypto evidence is refreshed after metadata cache expiry', async () => {
+  let now = NOW;
+  const q = quote('deribit', 'USDC'), f = fixture(q), clients = createPublicClients({ fetcher: f.fetcher, clock: () => now });
+  await clients.loadDepth(q); f.metadata.result.underlying_type = 'crypto_index'; now += 300_001;
+  await assert.rejects(clients.loadDepth(q), /未确认/);
+  assert.equal(f.requests.filter(item => item.url.includes('/get_instrument?')).length, 2);
+  assert.equal(f.requests.filter(item => item.url.includes('/get_order_book?')).length, 1);
 });

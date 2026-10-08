@@ -4,7 +4,9 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createStore } from './store.mjs';
-import { createEngine } from './engine.mjs';
+import { createMarket } from './market.mjs';
+import { createLiveRuntime } from './live-runtime.mjs';
+import { createTerminalMarket } from './terminal-market.mjs';
 import { AppError } from './model.mjs';
 import { createAuthenticator } from './auth.mjs';
 
@@ -18,7 +20,7 @@ async function body(req) {
   for await (const chunk of req) { size += chunk.length; if (size > 16384) throw new AppError('请求过大', 413); chunks.push(chunk); }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw new AppError('请求格式无效'); }
 }
-export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, publicOrigin = process.env.PUBLIC_ORIGIN || '', intervalMs = 5000, sourceIntervalMs = intervalMs > 0 ? Math.min(intervalMs, 2000) : 0, engineOptions, logger = console.log, distDir = path.join(root, 'dist') } = {}) {
+export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.data'), initialPassword = process.env.INITIAL_PASSWORD, publicOrigin = process.env.PUBLIC_ORIGIN || '', intervalMs = 5000, sourceIntervalMs = intervalMs > 0 ? Math.min(intervalMs, 2000) : 0, marketOptions, liveOptions, terminalOptions, engineOptions, logger = console.log, distDir = path.join(root, 'dist') } = {}) {
   const store = createStore(dataDir);
   if (!store.get('password')) {
     const value = initialPassword || randomBytes(18).toString('base64url');
@@ -26,24 +28,29 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     store.set('password', makePassword(value));
     if (!initialPassword) logger(`CrossEx 初始登录信息：admin / ${value}\n首次显示，请保存。重置：node server/setup.mjs --reset-password`);
   }
-  const engine = createEngine(store, engineOptions), csrf = randomBytes(32).toString('base64url');
+  // The old paper engine is deliberately not imported. Saved simulated orders,
+  // positions and automation flags cannot enter this execution path.
+  const market = createMarket(store, marketOptions ?? engineOptions);
+  let live;
+  try { live = createLiveRuntime(store, { ...liveOptions, market }); }
+  catch (error) { store.close(); throw error; }
+  const terminal = createTerminalMarket({ ...terminalOptions, market });
+  const csrf = randomBytes(32).toString('base64url');
   const auth = createAuthenticator({ getRecord: () => store.get('password') });
   let runningTick = false, stopping = false;
   const json = (res, status, value) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' }); res.end(JSON.stringify(value)); };
   const runTick = async () => {
     if (stopping) return;
-    // Keep the source current even while a catalog or simulation depth read is slow.
-    const refresh = engine.refreshSource();
+    // Market discovery and account reconciliation are independent read-only lanes.
+    void market.refreshSource();
     if (runningTick) return;
     runningTick = true;
-    try { await refresh; await engine.tick({ refreshSource: false }); void engine.refreshAccounting(); void engine.refreshValuations(); }
-    catch { logger('模拟服务本轮未完成，等待下一次检查'); }
+    try { await Promise.all([market.refreshCatalog(), live.refresh()]); }
+    catch { logger('账户或行情本轮读取未完成，等待下一次检查'); }
     finally { runningTick = false; }
   };
   const timer = intervalMs > 0 ? setInterval(runTick, intervalMs) : null; timer?.unref();
-  // Read quotes faster than the simulation cycle: the source BBO may already be
-  // five seconds old. This lane is single-flight inside the engine.
-  const sourceTimer = sourceIntervalMs > 0 ? setInterval(() => { if (!stopping) void engine.refreshSource(); }, sourceIntervalMs) : null; sourceTimer?.unref();
+  const sourceTimer = sourceIntervalMs > 0 ? setInterval(() => { if (!stopping) void market.refreshSource(); }, sourceIntervalMs) : null; sourceTimer?.unref();
   if (intervalMs > 0) void runTick();
   async function authenticate(req) {
     return auth.authenticate(req.headers.authorization || '');
@@ -53,22 +60,29 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
     res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; form-action 'self'");
     try {
       const url = new URL(req.url, 'http://localhost'), route = url.pathname;
-      if (route === '/api/health' && req.method === 'GET') return json(res, 200, { status: 'ok', mode: 'paper', liveTradingAvailable: false });
-      if (!await authenticate(req)) { res.setHeader('WWW-Authenticate', 'Basic realm="Gate CrossEx paper", charset="UTF-8"'); return json(res, 401, { error: '需要模块登录信息' }); }
+      if (route === '/api/health' && req.method === 'GET') return json(res, 200, { status: 'ok', mode: 'live', executionMode: 'manual', liveTradingAvailable: true });
+      if (!await authenticate(req)) { res.setHeader('WWW-Authenticate', 'Basic realm="Gate CrossEx", charset="UTF-8"'); return json(res, 401, { error: '需要模块登录信息' }); }
       if (!['GET', 'HEAD'].includes(req.method)) {
         const expected = publicOrigin || `http://${req.headers.host}`;
         if (req.headers.origin !== expected || req.headers['sec-fetch-site'] === 'cross-site' || !equal(req.headers['x-csrf-token'] || '', csrf)) throw new AppError('操作来源或会话校验失败，请刷新页面', 403);
       }
-      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...engine.view({ includeHistory: url.searchParams.get('history') !== '0', historyVersion: url.searchParams.get('historyVersion') }), csrfToken: csrf });
+      if (route === '/api/state' && req.method === 'GET') return json(res, 200, { ...live.view(), csrfToken: csrf });
       if (route === '/api/hub/summary' && req.method === 'GET') {
-        if (url.searchParams.get('schemaVersion') === '2') return json(res, 200, { schemaVersion: 2, data: engine.summary() });
-        const value = engine.summary();
+        if (url.searchParams.get('schemaVersion') === '2') return json(res, 200, { schemaVersion: 2, data: live.summary() });
+        const value = live.summary();
         return json(res, 200, { schemaVersion: 1, data: { updatedAt: value.updatedAt || new Date(0).toISOString(), metrics: value.metrics } });
       }
-      if (route === '/api/settings' && req.method === 'PUT') return json(res, 200, await engine.settings(await body(req)));
-      if (route === '/api/open' && req.method === 'POST') { const input = await body(req); return json(res, 200, await engine.open(input.signalId, input.requestId)); }
-      if (route === '/api/close' && req.method === 'POST') { const input = await body(req); return json(res, 200, await engine.closePosition(input.positionId, input.requestId)); }
-      if (route === '/api/execution' && req.method === 'POST') { const input = await body(req); return json(res, 200, await engine.executionAction(input.executionId, input.action, input.requestId)); }
+      if (route === '/api/settings' && req.method === 'PUT') return json(res, 200, market.settings(await body(req)));
+      if (route === '/api/live/connection' && req.method === 'PUT') return json(res, 200, await live.connection(await body(req)));
+      if (route === '/api/live/connection' && req.method === 'DELETE') return json(res, 200, await live.disconnect());
+      if (route === '/api/live/refresh' && req.method === 'POST') { await body(req); await live.refresh(); return json(res, 200, live.view()); }
+      if (route === '/api/live/instruments' && req.method === 'GET') return json(res, 200, await market.instruments());
+      if (route === '/api/live/market' && req.method === 'GET') return json(res, 200, await terminal.read(url.searchParams.get('symbol'), url.searchParams.get('interval') || '5m'));
+      if (route === '/api/live/preview' && req.method === 'POST') return json(res, 200, await live.preview(await body(req)));
+      if (route === '/api/live/confirm' && req.method === 'POST') return json(res, 200, await live.confirm(await body(req)));
+      if (route === '/api/live/cancel' && req.method === 'POST') return json(res, 200, await live.cancel(await body(req)));
+      if (route.startsWith('/api/live/requests/') && req.method === 'GET') return json(res, 200, await live.requestStatus(decodeURIComponent(route.slice('/api/live/requests/'.length))));
+      if (['/api/open', '/api/close', '/api/execution'].includes(route)) throw new AppError('模拟交易接口已移除，请刷新页面并使用实盘预览确认', 410);
       if (route.startsWith('/api/')) throw new AppError('不支持此接口或请求方法', 404);
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new AppError('不支持此请求方法', 405);
       const asset = route === '/' ? 'index.html' : route.replace(/^\//, '');
@@ -77,8 +91,8 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
       const types = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml' };
       if (/^assets\/[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(?:js|css)$/.test(asset)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       res.writeHead(200, { 'Content-Type': types[path.extname(asset)] || 'application/octet-stream' }); res.end(req.method === 'HEAD' ? undefined : content);
-    } catch (error) { if (!res.headersSent) json(res, error instanceof AppError ? error.status : 500, { error: error instanceof AppError ? error.message : '操作未完成，请检查服务状态' }); else res.end(); }
+    } catch (error) { if (!res.headersSent) json(res, error instanceof AppError ? error.status : 500, { error: error instanceof AppError ? error.message : '操作未完成，请检查服务状态', ...(error.requestStatus === 'not_submitted' ? { requestStatus: 'not_submitted' } : {}) }); else res.end(); }
   });
   server.requestTimeout = 15000; server.headersTimeout = 10000;
-  return { server, engine, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); auth.reset(); return password; }, async close() { stopping = true; clearInterval(timer); clearInterval(sourceTimer); await engine.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
+  return { server, market, live, terminal, store, resetPassword() { const password = randomBytes(18).toString('base64url'); store.set('password', makePassword(password)); auth.reset(); return password; }, async close() { stopping = true; clearInterval(timer); clearInterval(sourceTimer); await live.stop(); await terminal.stop(); await market.stop(); await new Promise(resolve => server.listening ? server.close(resolve) : resolve()); store.close(); } };
 }

@@ -186,7 +186,7 @@ input_keys() {
   typecheck_tree=$(tree_hash src tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts) || return
   test_tree=$(tree_hash src public server tests tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html) || return
   build_tree=$(tree_hash src public tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts index.html .env .env.local .env.production .env.production.local) || return
-  runtime_tree=$(tree_hash server package.json) || return
+  runtime_tree=$(tree_hash server package.json LICENSE THIRD_PARTY_NOTICES.md) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
   dependency_key=$(printf 'dependencies-v2\n%s\n%s' "$dependency_tree" "$runtime_key" | hash)
   typecheck_key=$(printf 'typecheck-v2\n%s\n%s' "$typecheck_tree" "$dependency_key" | hash)
@@ -299,6 +299,11 @@ prepare_application() {
   mkdir "$work_dir/publish"
   # Re-extract runtime source as root; tests/builds cannot modify published code.
   git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json | tar -x -C "$work_dir/publish"
+  for notice in LICENSE THIRD_PARTY_NOTICES.md; do
+    if git --git-dir="$APP_DIR/repository.git" cat-file -e "$commit:$notice" 2>/dev/null; then
+      git --git-dir="$APP_DIR/repository.git" show "$commit:$notice" > "$work_dir/publish/$notice"
+    fi
+  done
   cp -a "$built/dist" "$work_dir/publish/dist"
   if (( RUNTIME_DEPENDENCIES )); then
     prepare_dependencies
@@ -313,7 +318,7 @@ write_unit() {
   cat > "$work_dir/service" <<EOF
 # Managed by gate-crossex-arbitrage installer
 [Unit]
-Description=Gate CrossEx simulation
+Description=Gate CrossEx manual live terminal
 After=network-online.target
 Wants=network-online.target
 

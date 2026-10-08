@@ -119,6 +119,10 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
       const data = await cached('hyperliquid', () => info('meta'));
       row = data.universe?.find(item => item.name === symbol);
       if (!row || row.name !== rawBase || baseName(row.name) !== base || row.isDelisted === true || !Number.isInteger(row.szDecimals) || row.szDecimals < 0 || !positive(row.maxLeverage) || data.collateralToken !== 0 || settle !== 'USDC' || quoteCurrency !== (['HYPE', 'PURR'].includes(symbol) ? 'USDC' : 'USDT')) throw failure('Hyperliquid 合约身份或结算币未确认');
+    } else if (exchange === 'deribit') {
+      const data = await cached(`deribit:${symbol}`, () => get(`https://www.deribit.com/api/v2/public/get_instrument?instrument_name=${encoded}`));
+      row = data.result;
+      if (data.error || !row || row.instrument_name !== symbol || row.kind !== 'future' || row.is_active !== true || (row.instrument_type ?? row.future_type) !== 'linear' || row.instrument_type && row.future_type && row.instrument_type !== row.future_type || row.underlying_type !== 'crypto' || row.state !== undefined && row.state !== 'open' || row.settlement_period !== 'perpetual' || row.base_currency !== base || row.quote_currency !== 'USDC' || row.settlement_currency !== 'USDC' || settle !== 'USDC' || quoteCurrency !== 'USDC') throw failure('Deribit 线性永续合约身份未确认');
     } else if (exchange === 'lighter') {
       const data = await cached('lighter', () => get(LIGHTER_MARKETS));
       row = data.order_book_details?.find(item => item.symbol === symbol && item.market_type === 'perp');
@@ -150,6 +154,11 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
     } else if (exchange === 'gate') {
       source = `https://api.gateio.ws/api/v4/futures/usdt/order_book?contract=${encoded}&limit=100`;
       data = await get(source); ({ bids, asks } = data); at = Number(data.update) * 1000;
+    } else if (exchange === 'deribit') {
+      source = `https://www.deribit.com/api/v2/public/get_order_book?instrument_name=${encoded}&depth=100`;
+      data = await get(source);
+      if (data.error || data.result?.instrument_name !== symbol || data.result?.state !== 'open') throw failure('Deribit 深度合约或状态无效');
+      ({ bids, asks, timestamp: at } = data.result);
     } else if (exchange === 'hyperliquid') {
       source = HYPERLIQUID_INFO; data = await info('l2Book', symbol);
       if (data.coin !== symbol) throw failure('Hyperliquid 深度合约不一致');
@@ -220,13 +229,39 @@ export function createPublicClients({ fetcher = fetch, WebSocketImpl = WebSocket
     })().finally(() => { fxFlight = null; });
     return fxFlight;
   }
+  // Resolve an account position independently of Monitor. The exchange's current
+  // instrument metadata is still verified by contract(); a symbol alone is not
+  // accepted as evidence that a perpetual is a comparable crypto contract.
+  async function resolveCrossexQuote(crossexSymbol) {
+    const match = /^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_([A-Z0-9]{1,30})_(USDT|USDC|USD)$/.exec(crossexSymbol);
+    if (!match) throw failure('该持仓合约不在支持的永续范围内');
+    const exchange = match[1].toLowerCase(), base = match[2], counterCurrency = match[3];
+    const quoteCurrency = exchange === 'hyperliquid' && !['HYPE', 'PURR'].includes(base) ? 'USDT' : counterCurrency;
+    const symbol = exchange === 'binance' ? `${base}${quoteCurrency}`
+      : exchange === 'bybit' ? quoteCurrency === 'USDC' ? `${base}PERP` : `${base}${quoteCurrency}`
+      : exchange === 'okx' ? `${base}-${quoteCurrency}-SWAP`
+      : exchange === 'gate' ? `${base}_USDT`
+      : exchange === 'deribit' ? `${base}_USDC-PERPETUAL`
+      : exchange === 'kraken' ? `PF_${base === 'BTC' ? 'XBT' : base}USD` : base;
+    const q = { exchange, symbol, base, rawBase: base, quoteCurrency, counterCurrency,
+      settlementCurrency: counterCurrency, collateralCurrency: exchange === 'kraken' ? 'MULTI' : counterCurrency,
+      contractKind: exchange === 'hyperliquid' && quoteCurrency !== counterCurrency ? 'quanto' : 'linear',
+      crossexSymbol, multiplier: 1, assetClass: 'crypto', identityVerified: true, identitySource: 'exchange-instrument-metadata' };
+    if (exchange === 'lighter') {
+      const data = await cached('lighter', () => get(LIGHTER_MARKETS));
+      q.marketId = data.order_book_details?.find(item => item.symbol === symbol && item.market_type === 'perp')?.market_id;
+    }
+    if (!validIdentity(q)) throw failure('持仓的合约币种或数量身份不受支持');
+    await contract(q);
+    return q;
+  }
   const loadCatalog = () => get(CATALOG_URL);
   async function loadFeed(config, password) {
     const url = `${monitorUrl(config.monitorUrl)}/api/monitors/perpetual/opportunities-v2`;
     try { return await getJson(url, { ...options, headers: password ? { Authorization: `Basic ${Buffer.from(`${config.monitorUsername}:${password}`).toString('base64')}` } : {} }); }
     catch (error) { if (error.sourceStatus === 404) throw failure('价差服务缺少新版七所信号接口，请先升级 Monitor'); throw error; }
   }
-  return { loadCatalog, loadFeed, loadDepth, loadFx };
+  return { loadCatalog, loadFeed, loadDepth, loadFx, resolveCrossexQuote };
 }
 
 const clients = createPublicClients();
@@ -234,3 +269,4 @@ export const loadCatalog = clients.loadCatalog;
 export const loadFeed = clients.loadFeed;
 export const loadDepth = clients.loadDepth;
 export const loadFx = clients.loadFx;
+export const resolveCrossexQuote = clients.resolveCrossexQuote;

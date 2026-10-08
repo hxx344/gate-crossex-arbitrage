@@ -39,6 +39,8 @@ refresh
 capture
 echo docs > "$source_dir/README.md"; refresh; compare 0 0 0 0 0
 capture
+echo license > "$source_dir/LICENSE"; refresh; compare 0 0 0 0 1
+capture
 echo test >> "$source_dir/tests/app.test.mjs"; refresh; compare 0 0 1 0 0
 capture
 echo backend >> "$source_dir/server/index.mjs"; refresh; compare 0 0 1 0 1

@@ -1,6 +1,6 @@
 # 部署、配置与恢复
 
-使用 README 中的一键命令安装或升级。七所扩展需要先更新 Monitor（提供 opportunities-v2），再更新 CrossEx；旧版来源会显示明确升级提示。已保存的登录、配置和 USDT 模拟持仓保持不变。默认只监听 `127.0.0.1:3200`，使用专用系统用户 `gate-crossex-arbitrage`，与原项目端口、配置和数据分离。
+使用 README 中的一键命令安装或升级。独立交易终端无需 Monitor；需要价差机会时先更新 Monitor（提供 opportunities-v2），再更新 CrossEx。已保存的登录和配置保留，旧模拟记录留存但不再执行或展示。默认只监听 `127.0.0.1:3200`，使用专用系统用户 `gate-crossex-arbitrage`，与原项目端口、配置和数据分离。版本目录包含 AGPL 许可及参考来源说明，界面提供公开源代码链接。
 
 | 路径 | 用途 |
 | --- | --- |
@@ -12,9 +12,9 @@
 | `/opt/gate-crossex-arbitrage/.last-successful.env` | root 可读的上次健康配置 |
 | `/etc/systemd/system/gate-crossex-arbitrage.service` | 自动管理的服务 |
 
-环境文件采用无引号 `KEY=value`。支持 `HOST`、`PORT`、`DATA_DIR`、`NODE_ENV` 和可选 `PUBLIC_ORIGIN`。可选 `INITIAL_PASSWORD` 仅首次建库时使用，后续不会覆盖已保存密码。不要在这里填写交易所密钥；此版本不使用它们。
+环境文件采用无引号 `KEY=value`。支持 `HOST`、`PORT`、`DATA_DIR`、`NODE_ENV` 和可选 `PUBLIC_ORIGIN`。可选 `INITIAL_PASSWORD` 仅首次建库时使用，后续不会覆盖已保存密码。Gate CrossEx API Key / Secret 在界面中连接，不写入环境文件。
 
-Monitor 登录信息与模拟参数在模块界面保存；用户名、服务地址是配置，密码由服务器 AES-256-GCM 加密，公开状态接口不会返回密码。Monitor 来源读取与目录使用 GET，Hyperliquid 行情使用只读 info POST，Kraken / Lighter 使用单次公开 WebSocket；来源重定向被拒绝。外部盘口目标固定，Monitor 来源只接受回环地址。通常继续复用工作台 SSH 通道即可。直接通过 HTTPS 反向代理访问时须设置 `PUBLIC_ORIGIN=https://实际域名`，并让反向代理保留请求 Host；同时使用工作台代理时，把工作台该项目的“登录来源地址”设置为相同来源。默认 HTTP / SSH 代理部署留空。
+Monitor 登录信息、Gate CrossEx 凭据与手动交易参数在界面保存；密码和交易密钥由服务器 AES-256-GCM 加密，状态接口不返回密钥。后台只查询账户和订单，交易写请求必须来自手动确认或撤单。Monitor 来源读取与目录使用 GET，Hyperliquid 行情使用只读 info POST，Kraken / Lighter 使用单次公开 WebSocket；来源重定向被拒绝。外部盘口目标固定，Monitor 来源只接受回环地址。通常继续复用工作台 SSH 通道即可。直接通过 HTTPS 反向代理访问时须设置 `PUBLIC_ORIGIN=https://实际域名`，并让反向代理保留请求 Host；同时使用工作台代理时，把工作台该项目的“登录来源地址”设置为相同来源。默认 HTTP / SSH 代理部署留空。
 
 配置示例：
 
@@ -48,8 +48,8 @@ sudo -u gate-crossex-arbitrage env DATA_DIR=/var/lib/gate-crossex-arbitrage "$(c
 
 新密码保存后旧认证失效；更新工作台保存的本模块凭据。浏览器可能需要关闭原页面再重新打开。修改数据目录时对应调整命令。
 
-备份前停止服务，备份整个数据目录和环境文件，再启动服务。必须同时保留 `crossex.sqlite`、可能存在的 WAL 文件与 `credentials.key`。缺失加密密钥时服务会拒绝打开已有数据库。模拟记录不会自动清空；自动模拟启停状态在重启后保留。
+备份前停止服务，备份整个数据目录和环境文件，再启动服务。必须同时保留 `crossex.sqlite`、可能存在的 WAL 文件与 `credentials.key`。缺失加密密钥时服务会拒绝打开已有数据库。旧模拟记录保留但不参与实盘。重启后只读核对已提交或未知订单，不重发订单、不恢复未发送的腿。同一数据目录的第二实例不能执行交易。
 
 `/api/health` 只表示本地服务可运行；Monitor 或交易所连接状态以界面和摘要为准，不能用健康检查成功证明行情或策略可执行。
 
-Kraken 公开盘口需要服务器可连接 `wss://futures.kraken.com/ws/v1`，Lighter 需要 `wss://mainnet.zklighter.elliot.ai/stream`。当前 CrossEx WebSocket 使用直连；连接失败会显示原因并停止相关模拟，不使用本地时间冒充盘口时间。
+Kraken 公开盘口需要服务器可连接 `wss://futures.kraken.com/ws/v1`，Lighter 需要 `wss://mainnet.zklighter.elliot.ai/stream`。当前 CrossEx WebSocket 使用直连；连接失败会阻止相关订单预览，不使用本地时间冒充盘口时间。私有账户读取与交易需要访问 https://api.gateio.ws/api/v4/crossex/。

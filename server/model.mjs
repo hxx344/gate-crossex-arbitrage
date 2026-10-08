@@ -38,7 +38,7 @@ export function configuration(input, previous = defaults) {
 }
 export const quoteKey = q => `${q.exchange}:${q.symbol}`;
 export const pairKey = s => JSON.stringify([s.base, quoteKey(s.long), quoteKey(s.short)]);
-export const SUPPORTED_VENUES = Object.freeze(['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter']);
+export const SUPPORTED_VENUES = Object.freeze(['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter', 'deribit']);
 export const settlement = q => q?.settlementCurrency ?? q?.quoteCurrency ?? 'USDT';
 export function contractIdentity(q) {
   return JSON.stringify([q.exchange, q.symbol, q.base, q.rawBase ?? q.base, q.quoteCurrency, settlement(q), q.collateralCurrency, q.multiplier, q.contractKind ?? 'linear', q.counterCurrency ?? q.quoteCurrency, q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_${q.quoteCurrency}`, q.marketId ?? null]);
@@ -53,6 +53,7 @@ export function validIdentity(q) {
   } else if (q.exchange === 'gate') { if (currency !== 'USDT' || base === 'EDGE') return false; symbol = `${base}_USDT`; }
   else if (q.exchange === 'kraken') { if (currency !== 'USD') return false; symbol = `PF_${base === 'BTC' ? 'XBT' : base}USD`; collateral = 'MULTI'; }
   else if (q.exchange === 'hyperliquid') { if (currency !== (['HYPE', 'PURR'].includes(base) ? 'USDC' : 'USDT')) return false; symbol = base; settle = collateral = counter = 'USDC'; kind = currency === 'USDC' ? 'linear' : 'quanto'; }
+  else if (q.exchange === 'deribit') { if (currency !== 'USDC') return false; symbol = `${base}_USDC-PERPETUAL`; }
   else { if (currency !== 'USDC' || base === 'AI' || !Number.isInteger(q.marketId) || q.marketId < 0) return false; symbol = base; }
   const legacy = ['binance', 'bybit'].includes(q.exchange) && currency === 'USDT' && q.settlementCurrency === undefined && q.contractKind === undefined && q.crossexSymbol === undefined;
   return q.symbol === symbol && q.collateralCurrency === collateral && (legacy || (q.settlementCurrency === settle && q.contractKind === kind && q.counterCurrency === counter && q.crossexSymbol === `${q.exchange.toUpperCase()}_FUTURE_${base}_${counter}`));
@@ -107,7 +108,7 @@ export function validateFeed(feed, now) {
   return feed;
 }
 export function catalogRule(q, catalog) {
-  if (!validIdentity(q)) throw new AppError('仅支持七所身份明确、单位为 1 的普通加密永续');
+  if (!validIdentity(q)) throw new AppError('仅支持身份明确、单位为 1 的普通加密永续');
   const symbol = q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_USDT`;
   const rule = catalog.find(x => x.symbol === symbol && x.exchange_type === q.exchange.toUpperCase() && x.business_type === 'FUTURE');
   if (!rule || rule.state !== 'live' || String(rule.delist_time ?? '') !== '0') throw new AppError(`${symbol} 未在 CrossEx 确认为可用合约`);

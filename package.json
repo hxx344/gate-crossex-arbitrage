@@ -2,8 +2,9 @@
   "name": "gate-crossex-arbitrage",
   "version": "0.1.0",
   "private": true,
+  "license": "AGPL-3.0-only",
   "type": "module",
-  "description": "Gate CrossEx 永续价差套利模拟工作台",
+  "description": "Gate CrossEx 手动实盘交易与持仓观察工作台",
   "engines": { "node": ">=24.15.0" },
   "scripts": {
     "dev": "vite --host 127.0.0.1",

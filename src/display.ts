@@ -4,7 +4,7 @@ export function format(value: number | string | null | undefined, digits = 2) {
   return !Number.isFinite(number) ? '—' : number.toLocaleString('zh-CN', { minimumFractionDigits: digits, maximumFractionDigits: digits });
 }
 export const time = (value: number | null | undefined) => value ? new Date(value).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '暂无时间';
-export const venues: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX', gate: 'Gate', kraken: 'Kraken', hyperliquid: 'Hyperliquid', lighter: 'Lighter' };
+export const venues: Record<string, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX', gate: 'Gate', kraken: 'Kraken', hyperliquid: 'Hyperliquid', lighter: 'Lighter', deribit: 'Deribit' };
 export const venue = (name: string) => venues[name] || name;
 export const direction = (row: { long: { exchange: string }; short: { exchange: string } }) => `${venue(row.long.exchange)} 做多 → ${venue(row.short.exchange)} 做空`;
 export const stateLabel = (state: string) => ({ live: '已连接', partial: '部分行情可用', offline: '未连接', stale: '数据过期', cached: '使用缓存', unavailable: '等待连接', connecting: '连接中', error: '连接异常', disabled: '未启用' }[state] || state);

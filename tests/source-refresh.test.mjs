@@ -7,7 +7,7 @@ import { setImmediate as turn } from 'node:timers/promises';
 import { createApp } from '../server/app.mjs';
 import { AppError } from '../server/model.mjs';
 import { fixture, feed, book, catalog, epoch } from './fixtures.mjs';
-import { STATE_POLL_MS, valuationStaleReason } from '../src/freshness.ts';
+import { STATE_POLL_MS, sourceIsStale } from '../src/freshness.ts';
 
 function deferred(t) {
   let resolve, reject;
@@ -16,7 +16,7 @@ function deferred(t) {
   return { promise, resolve, reject };
 }
 
-test('default source cadence keeps held valuations fresh across out-of-phase five-second upstream snapshots', async t => {
+test('default source cadence keeps discovery quotes fresh across out-of-phase five-second upstream snapshots', async t => {
   t.mock.timers.enable({ apis: ['setInterval'] });
   async function replay(pageIntervalMs, sourceIntervalMs) {
     let now = epoch;
@@ -32,14 +32,14 @@ test('default source cadence keeps held valuations fresh across out-of-phase fiv
       },
     });
     try {
-      await turn(); await app.engine.open(`signal-${epoch - 4900}`, 'cadence-held-position');
-      let displayed = app.engine.view().positions[0].valuation, oldSamples = 0;
+      await turn();
+      let displayed = app.market.view().source, oldSamples = 0;
       for (let elapsed = 100; elapsed <= 30000; elapsed += 100) {
         now = epoch + elapsed; t.mock.timers.tick(100); await turn();
         // The browser reads just before the next backend poll; include 200 ms
         // of transit time in the display's conservative age calculation.
-        if (elapsed % pageIntervalMs === pageIntervalMs - 100) displayed = app.engine.view().positions[0].valuation;
-        if (elapsed >= 5000 && valuationStaleReason(displayed, now + 200, false)) oldSamples++;
+        if (elapsed % pageIntervalMs === pageIntervalMs - 100) displayed = app.market.view().source;
+        if (elapsed >= 5000 && sourceIsStale(displayed, now + 200, true)) oldSamples++;
       }
       return oldSamples;
     } finally {
@@ -142,17 +142,20 @@ for (const update of ['identity', 'normal', 'offline']) test(`close rechecks ide
   else assert.equal((await closing).status, 'closed');
 });
 
-for (const blocked of ['catalog', 'automatic close']) test(`app keeps refreshing every interval while ${blocked} is blocked`, async t => {
+for (const blocked of ['catalog', 'account read']) test(`app keeps refreshing every interval while ${blocked} is blocked`, async t => {
   t.mock.timers.enable({ apis: ['setInterval'] });
-  const gate = deferred(t), entered = deferred(); let now = epoch, reads = 0, blockDepth = false, closed = false;
+  const gate = deferred(t), entered = deferred(); let now = epoch, reads = 0, closed = false;
   const directory = mkdtempSync(join(tmpdir(), 'crossex-refresh-test-'));
   const app = createApp({ dataDir: directory, initialPassword: 'source-refresh-test-password', intervalMs: 5000,
     engineOptions: {
       clock: () => now,
       feedReader: async () => { reads++; return feed(now); },
       catalogReader: async () => { if (blocked === 'catalog') { entered.resolve(); await gate.promise; } return catalog; },
-      depthReader: async q => { if (blockDepth) { entered.resolve(); await gate.promise; } return book(q, now); },
-    }, logger() {},
+      depthReader: async q => book(q, now),
+    }, liveOptions: { clock: () => now, clientFactory: () => ({
+      async getAccount() { if (blocked === 'account read') { entered.resolve(); await gate.promise; } return { user_id: '12345', position_mode: 'DUAL', account_mode: 'CROSS_EXCHANGE', assets: [] }; },
+      async getPositions() { return []; }, async getOpenOrders() { return []; },
+    }) }, logger() {},
   });
   t.after(async () => {
     if (!closed) await app.close();
@@ -160,22 +163,17 @@ for (const blocked of ['catalog', 'automatic close']) test(`app keeps refreshing
     rmSync(directory, { recursive: true, force: true });
   });
   await turn();
-  if (blocked === 'automatic close') {
-    const p = await app.engine.open(`signal-${epoch}`, 'before-blocked-close');
-    app.store.savePosition({ ...p, maxHoldMinutes: 0 });
-    await app.engine.settings({ config: { enabled: true } });
-    blockDepth = true; t.mock.timers.tick(5000);
-  }
+  const connecting = blocked === 'account read' ? app.live.connection({ apiKey: 'isolated-key', apiSecret: 'isolated-secret' }) : Promise.resolve();
   await entered.promise;
   const initialReads = reads;
   for (let i = 1; i <= 3; i++) {
     now += 5000; t.mock.timers.tick(5000); await turn();
     assert.equal(reads, initialReads + i);
-    assert.equal(app.engine.view().source.checkedAt, now);
-    assert.equal(app.engine.view().source.updatedAt, now);
-    assert.equal(app.engine.view().source.state, 'live');
+    assert.equal(app.market.view().source.checkedAt, now);
+    assert.equal(app.market.view().source.updatedAt, now);
+    assert.equal(app.market.view().source.state, 'live');
   }
-  gate.resolve(); await turn();
+  gate.resolve(); await connecting; await turn();
   const beforeClose = reads; await app.close(); closed = true;
   t.mock.timers.tick(5000); await turn();
   assert.equal(reads, beforeClose, 'shutdown clears the refresh timer');
