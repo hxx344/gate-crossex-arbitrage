@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { createPublicClients } from '../server/clients.mjs';
 import { publicSnapshot } from '../server/public-snapshot.mjs';
 import { D } from '../server/money.mjs';
+import { validIdentity, validManualIdentity, validManualPair, contractIdentity } from '../server/model.mjs';
 
 const NOW = 1790067200000;
 function quote(exchange, currency = 'USDT', base = 'BTC') {
@@ -385,4 +386,79 @@ test('Deribit native crypto evidence is refreshed after metadata cache expiry', 
   await assert.rejects(clients.loadDepth(q), /未确认/);
   assert.equal(f.requests.filter(item => item.url.includes('/get_instrument?')).length, 2);
   assert.equal(f.requests.filter(item => item.url.includes('/get_order_book?')).length, 1);
+});
+
+test('Gate requests decimal contract sizes before converting fractional lots to base quantities', async () => {
+  const q = quote('gate', 'USDT', 'ETH'), f = fixture(q); f.metadata.quanto_multiplier = '0.01';
+  const fetcher = async (url, init) => {
+    if (!url.includes('/order_book?')) return f.fetcher(url, init);
+    assert.equal(init.headers['X-Gate-Size-Decimal'], '1');
+    return new Response(JSON.stringify({ update: NOW / 1000, bids: [{ p: '100', s: '0.15' }], asks: [{ p: '101', s: '0.25' }] }));
+  };
+  const clients = createPublicClients({ fetcher, clock: () => NOW });
+  assert.deepEqual((await clients.loadDepth(q)).bids, [[100, 0.0015]]);
+  const manual = await clients.resolveManualQuote(q.crossexSymbol);
+  assert.deepEqual((await clients.loadManualDepth(manual)).asks, [[101, 0.0025]]);
+});
+
+test('manual native identities and depth remain available without independent Binance metadata', async () => {
+  for (const [exchange, currency] of [['gate', 'USDT'], ['okx', 'USDT'], ['bybit', 'USDT'], ['deribit', 'USDC']]) {
+    const q = quote(exchange, currency), f = fixture(q); let independentRequests = 0;
+    const clients = createPublicClients({ clock: () => NOW, fetcher: (url, init) => {
+      if (url.endsWith('/exchangeInfo')) { independentRequests++; throw new Error('Binance unavailable'); }
+      return f.fetcher(url, init);
+    } });
+    const manual = await clients.resolveManualQuote(q.crossexSymbol);
+    assert.equal(manual.identityScope, 'manual'); assert.equal(manual.assetClass, 'crypto');
+    assert.equal(validManualIdentity(manual), true); assert.equal(validIdentity(manual), false);
+    assert.ok((await clients.loadManualDepth(manual)).bids.length); assert.equal(independentRequests, 0);
+    await assert.rejects(clients.loadDepth(manual), /不支持/); assert.equal(independentRequests, 0);
+    await assert.rejects(clients.loadDepth(q), /Binance unavailable/); assert.equal(independentRequests, 1);
+  }
+});
+
+test('manual noncrypto instruments require a documented native class and cannot authorize a crypto pair', async () => {
+  for (const [category, assetClass] of [['1', 'crypto'], ['3', 'stock'], ['4', 'commodity'], ['5', 'forex'], ['6', 'bond']]) {
+    const q = quote('okx', 'USDT', 'CL'), f = fixture(q); f.metadata.data[0].instCategory = category; f.metadata.data[0].ctVal = '0.1';
+    const clients = createPublicClients({ fetcher: f.fetcher, clock: () => NOW });
+    const manual = await clients.resolveManualQuote(q.crossexSymbol);
+    assert.equal(manual.assetClass, assetClass); assert.equal(manual.nativeUnit, '0.1');
+    assert.deepEqual((await clients.loadManualDepth(manual)).bids, [[100, 2], [99, 1]]);
+    const other = { ...manual, exchange: 'gate', symbol: 'CL_USDT', crossexSymbol: 'GATE_FUTURE_CL_USDT' };
+    assert.equal(validManualPair(manual, other), assetClass === 'crypto');
+    assert.ok(f.requests.every(r => !r.url.endsWith('/exchangeInfo')));
+  }
+  for (const category of [undefined, '', '2', 'unknown']) {
+    const q = quote('okx', 'USDT', 'CL'), f = fixture(q); f.metadata.data[0].instCategory = category;
+    await assert.rejects(createPublicClients({ fetcher: f.fetcher, clock: () => NOW }).resolveManualQuote(q.crossexSymbol), /未确认/);
+    assert.equal(f.requests.length, 1);
+  }
+});
+
+test('manual metadata resolution rechecks native units and classification before cache expiry', async () => {
+  const q = quote('gate'), f = fixture(q), clients = createPublicClients({ fetcher: f.fetcher, clock: () => NOW });
+  const first = await clients.resolveManualQuote(q.crossexSymbol);
+  f.metadata.quanto_multiplier = '0.01';
+  const changed = await clients.resolveManualQuote(q.crossexSymbol);
+  assert.equal(changed.nativeUnit, '0.01'); assert.notEqual(contractIdentity(first), contractIdentity(changed));
+  await assert.rejects(clients.loadManualDepth(first), /数量单位已变化/);
+  f.metadata.contract_type = 'commodities';
+  const commodity = await clients.resolveManualQuote(q.crossexSymbol);
+  assert.equal(commodity.comparable, false); assert.notEqual(contractIdentity(changed), contractIdentity(commodity));
+  f.metadata.status = 'circuit_breaker';
+  await assert.rejects(clients.resolveManualQuote(q.crossexSymbol), /未确认/);
+});
+
+test('manual pairs preserve native crypto identity, currency and known ambiguous ticker boundaries', async () => {
+  const gateFixture = fixture(quote('gate')), okxFixture = fixture(quote('okx'));
+  const gate = await createPublicClients({ fetcher: gateFixture.fetcher }).resolveManualQuote('GATE_FUTURE_BTC_USDT');
+  const okx = await createPublicClients({ fetcher: okxFixture.fetcher }).resolveManualQuote('OKX_FUTURE_BTC_USDT');
+  assert.equal(validManualPair(gate, okx), true);
+  for (const change of [{ rawBase: 'OTHER' }, { assetClass: 'commodity' }, { comparable: false }, { multiplier: 1000 }, { nativeUnit: undefined }, { settlementCurrency: 'USDC' }, { identitySource: 'browser' }, { identityVerified: false }]) {
+    assert.equal(validManualPair(gate, { ...okx, ...change }), false);
+  }
+  const edgeFixture = fixture(quote('gate', 'USDT', 'EDGE'));
+  const edge = await createPublicClients({ fetcher: edgeFixture.fetcher }).resolveManualQuote('GATE_FUTURE_EDGE_USDT');
+  assert.equal(validManualIdentity(edge), true); assert.equal(edge.comparable, false);
+  assert.equal(validManualPair(edge, { ...okx, base: 'EDGE', rawBase: 'EDGE', symbol: 'EDGE-USDT-SWAP', crossexSymbol: 'OKX_FUTURE_EDGE_USDT' }), false);
 });

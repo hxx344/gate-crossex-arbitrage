@@ -60,10 +60,10 @@ export type Instrument = {
 };
 export type MarketData = {
   symbol: string; exchange: string; base: string; quoteCurrency: string;
-  status: 'live' | 'stale' | 'unavailable' | 'connecting'; asOf: number | null; error?: string;
-  ticker: { lastPrice: string | null; bidPrice: string | null; askPrice: string | null; markPrice?: string | null; change24h?: string | null; fundingRate?: string | null; nextFundingAt?: number | null; volume24h?: string | null } | null;
-  book: { bids: [string, string][]; asks: [string, string][]; at: number | null; quantityUnit: 'base' } | null;
+  status: 'live' | 'stale' | 'unavailable' | 'connecting'; asOf: number | null; error?: string | null; tradingAvailable?: boolean; tradingReason?: string | null;
+  ticker: { lastPrice: string | null; bidPrice: string | null; askPrice: string | null; markPrice?: string | null; markPriceAt?: number | null; change24h?: string | null; fundingRate?: string | null; nextFundingAt?: number | null; volume24h?: string | null } | null;
+  book: { bids: [string, string][]; asks: [string, string][]; at: number | null; quantityUnit: 'base' | 'contracts' } | null;
   candles: { time: number; open: string; high: string; low: string; close: string; volume: string }[];
-  trades: { id: string; price: string; quantity: string; side: string; at: number }[]; interval: string;
+  trades: { id: string; price: string; quantity: string; side: string; at: number; quantityUnit?: 'base' | 'contracts' }[]; interval: string;
   candleError?: string | null; candleAsOf?: number | null;
 };

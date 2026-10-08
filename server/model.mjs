@@ -41,21 +41,37 @@ export const pairKey = s => JSON.stringify([s.base, quoteKey(s.long), quoteKey(s
 export const SUPPORTED_VENUES = Object.freeze(['binance', 'bybit', 'okx', 'gate', 'kraken', 'hyperliquid', 'lighter', 'deribit']);
 export const settlement = q => q?.settlementCurrency ?? q?.quoteCurrency ?? 'USDT';
 export function contractIdentity(q) {
-  return JSON.stringify([q.exchange, q.symbol, q.base, q.rawBase ?? q.base, q.quoteCurrency, settlement(q), q.collateralCurrency, q.multiplier, q.contractKind ?? 'linear', q.counterCurrency ?? q.quoteCurrency, q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_${q.quoteCurrency}`, q.marketId ?? null]);
+  return JSON.stringify([q.exchange, q.symbol, q.base, q.rawBase ?? q.base, q.quoteCurrency, settlement(q), q.collateralCurrency, q.multiplier, q.contractKind ?? 'linear', q.counterCurrency ?? q.quoteCurrency, q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_${q.quoteCurrency}`, q.marketId ?? null, q.identityScope ?? 'comparable', q.nativeUnit ?? null, q.assetClass, q.comparable ?? true]);
 }
 export function validIdentity(q) {
-  if (!q || !SUPPORTED_VENUES.includes(q.exchange) || !/^[A-Z0-9]{1,30}$/.test(q.base) || (q.rawBase !== undefined && q.rawBase !== q.base) || q.multiplier !== 1 || q.assetClass !== 'crypto' || q.identityVerified !== true || typeof q.identitySource !== 'string' || !q.identitySource || q.comparable === false) return false;
+  if (!q || q.identityScope !== undefined && q.identityScope !== 'comparable' || q.assetClass !== 'crypto' || q.comparable === false) return false;
+  return identityShape(q);
+}
+// Manual identities are created by the native instrument reader, never by a
+// browser flag or Monitor. They do not authorize the strict Monitor path.
+export function validManualIdentity(q) {
+  if (!q || q.identityScope !== 'manual' || q.identitySource !== 'exchange-instrument-metadata'
+    || !['crypto', 'stock', 'commodity', 'forex', 'bond', 'index'].includes(q.assetClass)
+    || q.rawBase !== q.base || typeof q.nativeUnit !== 'string' || !positive(Number(q.nativeUnit)) || typeof q.comparable !== 'boolean') return false;
+  return identityShape(q, true);
+}
+export function validManualPair(left, right) {
+  const comparable = q => validManualIdentity(q) ? q.assetClass === 'crypto' && q.comparable === true && identityShape(q) : validIdentity(q);
+  return comparable(left) && comparable(right) && left.base === right.base && left.exchange !== right.exchange;
+}
+function identityShape(q, manual = false) {
+  if (!q || !SUPPORTED_VENUES.includes(q.exchange) || !/^[A-Z0-9]{1,30}$/.test(q.base) || (q.rawBase !== undefined && q.rawBase !== q.base) || q.multiplier !== 1 || q.identityVerified !== true || typeof q.identitySource !== 'string' || !q.identitySource) return false;
   const currency = q.quoteCurrency, base = q.base;
   let symbol, counter = currency, settle = currency, collateral = currency, kind = 'linear';
   if (['binance', 'bybit', 'okx'].includes(q.exchange)) {
     if (!['USDT', 'USDC'].includes(currency)) return false;
     symbol = q.exchange === 'okx' ? `${base}-${currency}-SWAP` : q.exchange === 'bybit' && currency === 'USDC' ? `${base}PERP` : `${base}${currency}`;
-  } else if (q.exchange === 'gate') { if (currency !== 'USDT' || base === 'EDGE') return false; symbol = `${base}_USDT`; }
+  } else if (q.exchange === 'gate') { if (currency !== 'USDT' || !manual && base === 'EDGE') return false; symbol = `${base}_USDT`; }
   else if (q.exchange === 'kraken') { if (currency !== 'USD') return false; symbol = `PF_${base === 'BTC' ? 'XBT' : base}USD`; collateral = 'MULTI'; }
   else if (q.exchange === 'hyperliquid') { if (currency !== (['HYPE', 'PURR'].includes(base) ? 'USDC' : 'USDT')) return false; symbol = base; settle = collateral = counter = 'USDC'; kind = currency === 'USDC' ? 'linear' : 'quanto'; }
   else if (q.exchange === 'deribit') { if (currency !== 'USDC') return false; symbol = `${base}_USDC-PERPETUAL`; }
-  else { if (currency !== 'USDC' || base === 'AI' || !Number.isInteger(q.marketId) || q.marketId < 0) return false; symbol = base; }
-  const legacy = ['binance', 'bybit'].includes(q.exchange) && currency === 'USDT' && q.settlementCurrency === undefined && q.contractKind === undefined && q.crossexSymbol === undefined;
+  else { if (currency !== 'USDC' || !manual && base === 'AI' || !Number.isInteger(q.marketId) || q.marketId < 0) return false; symbol = base; }
+  const legacy = !manual && ['binance', 'bybit'].includes(q.exchange) && currency === 'USDT' && q.settlementCurrency === undefined && q.contractKind === undefined && q.crossexSymbol === undefined;
   return q.symbol === symbol && q.collateralCurrency === collateral && (legacy || (q.settlementCurrency === settle && q.contractKind === kind && q.counterCurrency === counter && q.crossexSymbol === `${q.exchange.toUpperCase()}_FUTURE_${base}_${counter}`));
 }
 export function fxRate(currency, fx, now) {
@@ -110,7 +126,16 @@ export function validateFeed(feed, now) {
 export function catalogRule(q, catalog) {
   if (!validIdentity(q)) throw new AppError('仅支持身份明确、单位为 1 的普通加密永续');
   const symbol = q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_USDT`;
-  const rule = catalog.find(x => x.symbol === symbol && x.exchange_type === q.exchange.toUpperCase() && x.business_type === 'FUTURE');
+  return displayCatalogRule(symbol, catalog);
+}
+export function manualCatalogRule(q, catalog) {
+  if (!validManualIdentity(q) && !validIdentity(q)) throw new AppError('合约原生身份或数量单位未确认');
+  return displayCatalogRule(q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_USDT`, catalog);
+}
+export function displayCatalogRule(symbol, catalog) {
+  const match = /^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_([A-Z0-9]{1,30})_(USDT|USDC|USD)$/.exec(symbol);
+  if (!match) throw new AppError('请选择有效的 CrossEx 永续合约');
+  const rule = catalog.find(x => x.symbol === symbol && x.exchange_type === match[1] && x.business_type === 'FUTURE');
   if (!rule || rule.state !== 'live' || String(rule.delist_time ?? '') !== '0') throw new AppError(`${symbol} 未在 CrossEx 确认为可用合约`);
   for (const field of ['min_size', 'lot_size', 'tick_size']) if (!positive(Number(rule[field]))) throw new AppError(`${symbol} 缺少有效的数量或价格规则`);
   const unverifiedConstraints = [];

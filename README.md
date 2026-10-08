@@ -4,7 +4,7 @@
 
 前端布局与后端账户、订单、费用和行情契约参考 [your-quantguy/gate-crossex](https://github.com/your-quantguy/gate-crossex)，参考版本 `423356d`。保留本项目的一键部署与工作台接入方式。项目采用 AGPL-3.0-only，见 [LICENSE](LICENSE) 和[来源说明](THIRD_PARTY_NOTICES.md)。
 
-独立手动交易覆盖 Binance、OKX、Bybit、Gate、Kraken Futures、Hyperliquid、Lighter 和 Deribit 的普通加密永续；实际可交易合约以当前目录、原生合约身份、账户模式及权限为准。Market Monitor 提供的价差机会可以预填双腿。平台只保存 Gate CrossEx API Key / Secret。
+独立手动交易覆盖 Binance、OKX、Bybit、Gate、Kraken Futures、Hyperliquid、Lighter 和 Deribit 的普通加密永续，并允许原生分类和单位已确认的 OKX / Gate 非加密线性合约单腿交易；实际可交易合约以当前目录、原生合约身份、账户模式及权限为准。双腿仅支持身份可比的加密合约。Market Monitor 提供的价差机会可以预填双腿。平台只保存 Gate CrossEx API Key / Secret。
 
 ## 一条命令安装或升级
 
@@ -58,7 +58,9 @@ sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in mar
 
 ## 行情口径
 
-交易终端盘口来自原生公开完整快照，价格和数量已核验，盘口数量统一为基础币。成交价和资金费率来自 CrossEx 公共 WebSocket；K 线来自交易所真实历史接口，支持 1m / 5m / 15m / 30m / 1h / 4h / 1d。没有推送、历史缺口或读取失败时保留缺失状态，不生成模拟行情。只订阅最近使用的合约，并限制连接内合约数量。
+交易终端使用 CrossEx 公共 WebSocket 的完整盘口快照、成交价、标记价和资金费率，原生公开盘口作为补充。Gate / OKX 数量按原生确认的合约单位换算为基础币；单位尚未确认时保留原始张数，明确标注“张”，行情仍可查看但不能交易。各类行情分别检查来源时间，原生历史或合约查询失败不会遮住仍有效的 CrossEx 报价。K 线来自交易所真实历史接口，支持 1m / 5m / 15m / 30m / 1h / 4h / 1d。没有推送、历史缺口或读取失败时保留缺失状态，不生成模拟行情。只订阅最近使用的合约，并限制连接内合约数量。
+
+手动预览及确认独立核验本交易所的当前合约身份、分类和数量单位，不依赖第三方 Binance 目录在线；双腿另行核对可比性，Monitor 机会仍保留原有独立身份校验。Gate 原生盘口启用小数张数，避免小额档位被来源取整为零。
 
 Monitor 的现货/充提筛选可选。开启时其机会预览及确认都重新读取当前资格；机会撤回、屏蔽、证据过期、合约变化或来源缺失会阻止该机会开仓。已收到筛选策略的连接，不接受后续丢失策略的数据。独立手动订单由用户自己选择合约，不使用 Monitor 机会资格。
 

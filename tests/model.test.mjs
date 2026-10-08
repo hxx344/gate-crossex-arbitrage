@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { catalogRule, commonQuantity, configuration, fill, freshQuote, monitorUrl, validateBooks, validateFeed, validSignal } from '../server/model.mjs';
+import { catalogRule, commonQuantity, configuration, fill, freshQuote, monitorUrl, validateBooks, validateFeed, validSignal, validIdentity, contractIdentity } from '../server/model.mjs';
 import { epoch, quote, feed, catalog, book } from './fixtures.mjs';
 test('loopback source URLs only; credentials and unsafe paths are rejected', () => {
   assert.equal(monitorUrl('http://127.0.0.1:3000/'), 'http://127.0.0.1:3000');
@@ -22,6 +22,15 @@ test('signal expiry, direction, venue status and pairing are not trusted', () =>
   const value = feed(); assert.equal(validSignal(value.signals[0], value, epoch), true);
   for (const extra of [{ expiresAt: undefined }, { expiresAt: epoch - 1 }, { pairKey: 'fake' }, { long: quote('binance', epoch - 6000) }, { short: quote('bybit', epoch, { delisting: true }) }]) assert.equal(validSignal({ ...value.signals[0], ...extra }, value, epoch), false);
   value.exchanges[1].status = 'error'; assert.equal(validSignal(value.signals[0], value, epoch), false);
+});
+
+test('manual identity flags cannot authorize Monitor signals or disguise a changed asset class', () => {
+  const snapshot = feed(), signal = snapshot.signals[0];
+  const manual = { ...signal.long, identityScope: 'manual', nativeUnit: '1', comparable: true };
+  assert.equal(validIdentity(manual), false); assert.equal(freshQuote(manual, epoch), false);
+  assert.equal(validSignal({ ...signal, long: manual }, { ...snapshot, quotes: [manual, signal.short] }, epoch), false);
+  assert.notEqual(contractIdentity(signal.long), contractIdentity(manual));
+  for (const changes of [{ assetClass: 'commodity' }, { nativeUnit: '0.01' }, { comparable: false }]) assert.notEqual(contractIdentity(signal.long), contractIdentity({ ...signal.long, ...changes }));
 });
 test('CrossEx exact venue/contract matching, suspension and missing limits fail closed', () => {
   assert.equal(catalogRule(quote('binance'), catalog).symbol, 'BINANCE_FUTURE_BTC_USDT');

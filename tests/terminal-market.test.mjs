@@ -37,7 +37,7 @@ function terminalFixture(options = {}) {
     ping() { this.pings++; }
   }
   const service = createTerminalMarket({
-    market: { resolveSymbol: async symbol => { calls.resolve.push(symbol); if (options.resolve) return options.resolve(symbol); const q = quote(symbol.split('_')[0].toLowerCase(), symbol.split('_')[2]); return { quote: q, rule: { contract_size: '0.01' } }; } },
+    market: { resolveDisplaySymbol: async symbol => { if (options.display) return options.display(symbol); return { quote: quote(symbol.split('_')[0].toLowerCase(), symbol.split('_')[2]), rule: {} }; }, resolveSymbol: async symbol => { calls.resolve.push(symbol); if (options.resolve) return options.resolve(symbol); const q = quote(symbol.split('_')[0].toLowerCase(), symbol.split('_')[2]); return { quote: { ...q, nativeUnit: '0.01' }, rule: { contract_size: null } }; } },
     depthReader: async q => { calls.depth.push(q); return options.depth ? options.depth(q, now) : book(q, now); },
     candleReader: async (q, interval) => { calls.candles.push({ q, interval }); return options.candles ? options.candles(q, interval, now) : [bar(Math.floor(now / INTERVALS[interval]) * INTERVALS[interval])]; },
     WebSocketImpl: Socket, clock: () => now,
@@ -114,10 +114,8 @@ test('native error envelopes and invalid multiplier cannot masquerade as usable 
 });
 
 test('unavailable symbols return no sample book, ticker, trades or candles', async t => {
-  const f = terminalFixture({ resolve: async () => { throw new AppError('合约不可用'); } }); t.after(() => f.service.stop());
-  const value = await f.service.read(SYMBOL);
-  assert.equal(value.status, 'unavailable'); assert.equal(value.book, null); assert.equal(value.asOf, null);
-  assert.equal(value.ticker.lastPrice, null); assert.deepEqual(value.trades, []); assert.deepEqual(value.candles, []);
+  const f = terminalFixture({ display: async () => { throw new AppError('合约不可用'); } }); t.after(() => f.service.stop());
+  await assert.rejects(f.service.read(SYMBOL), /合约不可用/);
   assert.equal(f.calls.depth.length, 0); assert.equal(f.calls.candles.length, 0); assert.equal(f.Socket.instances.length, 0);
 });
 
@@ -134,16 +132,16 @@ test('public ticker and trade frames validate identity, time and prices, with tr
   for (const change of [{ i: '' }, { i: 'x'.repeat(200) }, { i: 'array-time', ts: [NOW] }, { i: 'old', ts: NOW - 300000 }, { i: 'future', ts: NOW + 1001 }, { i: 'side', S: 'buy' }, { i: 'zero', q: '0' }, { i: 'bad-price', p: 'NaN' }]) frame(socket, 'trade', { ...trade, ...change });
   value = await f.service.read(SYMBOL);
   assert.equal(value.ticker.lastPrice, '102');
-  assert.deepEqual(value.trades, [{ id: 'trade-1', price: '100.5', quantity: '0.123456789012345678901', side: 'BUY', at: NOW }]);
+  assert.deepEqual(value.trades, [{ id: 'trade-1', price: '100.5', quantity: '0.123456789012345678901', side: 'BUY', at: NOW, quantityUnit: 'base' }]);
 });
 
-test('Gate and OKX WS trade contract quantities require an explicit multiplier', async t => {
+test('Gate and OKX WS trades convert only with confirmed native units, otherwise retain labeled contracts', async t => {
   for (const exchange of ['gate', 'okx']) for (const size of ['0.0001', undefined]) {
     const q = quote(exchange), symbol = `${exchange.toUpperCase()}_FUTURE_BTC_USDT`;
-    const f = terminalFixture({ resolve: async () => ({ quote: q, rule: { contract_size: size } }) }); t.after(() => f.service.stop());
+    const f = terminalFixture({ resolve: async () => ({ quote: { ...q, nativeUnit: size }, rule: { contract_size: null } }) }); t.after(() => f.service.stop());
     await f.service.read(symbol); frame(f.Socket.instances[0], 'trade', { s: symbol, i: 'native-1', p: '100', q: '1250', S: 'SELL', ts: NOW });
     const value = await f.service.read(symbol);
-    assert.equal(value.trades.length, size ? 1 : 0); if (size) assert.equal(value.trades[0].quantity, '0.125');
+    assert.equal(value.trades.length, 1); assert.equal(value.trades[0].quantity, size ? '0.125' : '1250'); assert.equal(value.trades[0].quantityUnit, size ? 'base' : 'contracts');
   }
 });
 
@@ -160,15 +158,15 @@ test('snapshot regressions and failed refreshes preserve the last book with an h
 test('simultaneous readers share depth and candle work while repeated polling does not resubscribe', async t => {
   const gate = deferred(), f = terminalFixture({ depth: async q => { await gate.promise; return book(q); } }); t.after(() => f.service.stop());
   const reads = [f.service.read(SYMBOL), f.service.read(SYMBOL), f.service.read(SYMBOL)];
-  await Promise.resolve(); assert.equal(f.calls.depth.length, 1); gate.resolve();
+  await new Promise(setImmediate); assert.equal(f.calls.depth.length, 1); gate.resolve();
   const values = await Promise.all(reads); assert.ok(values.every(value => value.status === 'live'));
   assert.equal(f.calls.resolve.length, 1); assert.equal(f.calls.candles.length, 1);
   for (let i = 0; i < 5; i++) { f.advance(2000); await f.service.read(SYMBOL); }
-  assert.equal(f.Socket.instances.length, 1); assert.equal(f.Socket.instances[0].sent.filter(message => message.event === 'subscribe').length, 3);
+  assert.equal(f.Socket.instances.length, 1); assert.equal(f.Socket.instances[0].sent.filter(message => message.event === 'subscribe').length, 5);
   assert.equal(f.calls.candles.length, 1);
   await f.service.read(SYMBOL, '1m'); assert.equal(f.calls.candles.length, 2);
   assert.equal(f.Socket.instances[0].url, 'wss://api.gateio.ws/ws/crossex/public');
-  assert.ok(f.Socket.instances[0].sent.every(message => ['ticker', 'trade', 'funding_rate'].includes(message.channel)));
+  assert.ok(f.Socket.instances[0].sent.every(message => ['ticker', 'trade', 'funding_rate', 'mark_price', 'order_book_5'].includes(message.channel)));
   assert.equal(f.Socket.instances[0].options.maxPayload, 1000000);
 });
 
@@ -176,7 +174,7 @@ test('idle subscriptions are released and the empty public socket closes', async
   t.mock.timers.enable({ apis: ['setInterval'] });
   const f = terminalFixture(); t.after(() => f.service.stop()); await f.service.read(SYMBOL);
   const socket = f.Socket.instances[0]; f.advance(120001); t.mock.timers.tick(25000);
-  assert.equal(socket.sent.filter(message => message.event === 'unsubscribe').length, 3); assert.equal(socket.closed, 1);
+  assert.equal(socket.sent.filter(message => message.event === 'unsubscribe').length, 5); assert.equal(socket.closed, 1);
   await f.service.read(SYMBOL); assert.equal(f.Socket.instances.length, 2); assert.equal(f.calls.resolve.length, 2);
 });
 
@@ -184,7 +182,7 @@ test('stream cache and trade history remain bounded without mixing symbols', asy
   const f = terminalFixture(); t.after(() => f.service.stop());
   for (let i = 0; i < 13; i++) { await f.service.read(`BINANCE_FUTURE_COIN${i}_USDT`); f.advance(1); }
   const socket = f.Socket.instances[0];
-  assert.deepEqual(socket.sent.filter(message => message.event === 'unsubscribe').map(message => message.payload), Array(3).fill(['BINANCE_FUTURE_COIN0_USDT']));
+  assert.deepEqual(socket.sent.filter(message => message.event === 'unsubscribe').map(message => message.payload), Array(5).fill(['BINANCE_FUTURE_COIN0_USDT']));
   const symbol = 'BINANCE_FUTURE_COIN12_USDT';
   for (let i = 0; i < 70; i++) frame(socket, 'trade', { s: symbol, i: String(i), p: '100', q: '0.1', S: 'SELL', ts: f.now() - i });
   assert.equal((await f.service.read(symbol)).trades.length, 60);
@@ -193,7 +191,7 @@ test('stream cache and trade history remain bounded without mixing symbols', asy
 
 test('stop closes the socket and prevents a pending depth read from starting new candle work', async () => {
   const gate = deferred(), f = terminalFixture({ depth: async q => { await gate.promise; return book(q); } });
-  const reading = f.service.read(SYMBOL); await Promise.resolve();
+  const reading = f.service.read(SYMBOL); await new Promise(setImmediate);
   const stopping = f.service.stop(); gate.resolve(); await Promise.allSettled([reading, stopping]);
   assert.equal(f.Socket.instances[0].closed, 1); assert.equal(f.calls.candles.length, 0);
   await assert.rejects(f.service.read(SYMBOL), /停止/); await f.service.stop();
@@ -226,4 +224,65 @@ test('Deribit retains 960 source hours until all 240 four-hour bars are aggregat
   const reader = createCandleReader({ clock: () => NOW, fetcher: async () => json({ result: { status: 'ok', ticks, open: ticks.map(() => 100), high: ticks.map(() => 103), low: ticks.map(() => 99), close: ticks.map(() => 102), volume: ticks.map(() => 1) } }) });
   const values = await reader(quote('deribit'), '4h');
   assert.equal(values.length, 240); assert.equal(values[0].time, ticks[0]); assert.equal(values[0].volume, '4');
+});
+
+test('CrossEx books and mark prices remain usable when native identity and history are unavailable', async t => {
+  const symbol = 'OKX_FUTURE_CL_USDC';
+  const f = terminalFixture({ resolve: async () => { throw new AppError('原生合约不存在'); } }); t.after(() => f.service.stop());
+  let value = await f.service.read(symbol);
+  assert.equal(value.tradingAvailable, false);
+  const socket = f.Socket.instances[0];
+  frame(socket, 'order_book_5', { s: symbol, ts: NOW, b: [['72.1', '1250'], ['72', '100']], a: [['72.2', '300']] });
+  socket.emit('message', Buffer.from(JSON.stringify({ channel: 'mark_price', event: 'update', time_ms: NOW, result: { s: symbol, mp: '72.15' } })));
+  frame(socket, 'trade', { s: symbol, ts: NOW, p: '72.2', q: '10', S: 'BUY', i: 'cl-1' });
+  value = await f.service.read(symbol);
+  assert.equal(value.status, 'live'); assert.equal(value.error, null); assert.equal(value.ticker.bidPrice, '72.1'); assert.equal(value.ticker.markPrice, '72.15');
+  assert.equal(value.book.quantityUnit, 'contracts'); assert.equal(value.book.bids[0][1], '1250');
+  assert.equal(value.trades[0].quantityUnit, 'contracts'); assert.match(value.tradingReason, /原生合约不存在/);
+  assert.equal(value.tradingAvailable, false); assert.deepEqual(value.candles, []); assert.equal(f.calls.depth.length, 0);
+  f.advance(11000); value = await f.service.read(symbol);
+  assert.equal(value.status, 'stale'); assert.equal(value.ticker.markPrice, null);
+});
+
+test('native quantity confirmation converts cached raw books and prints together without mixing units', async t => {
+  const symbol = 'GATE_FUTURE_ETH_USDT'; let available = false;
+  const f = terminalFixture({ resolve: async () => { if (!available) throw new AppError('暂未确认单位'); return { quote: { ...quote('gate', 'ETH'), nativeUnit: '0.01' }, rule: {} }; } }); t.after(() => f.service.stop());
+  await f.service.read(symbol); const socket = f.Socket.instances[0];
+  frame(socket, 'order_book_5', { s: symbol, ts: NOW, b: [['3000', '0.75']], a: [['3001', '125']] });
+  frame(socket, 'trade', { s: symbol, ts: NOW, p: '3000', q: '0.75', S: 'BUY', i: 'eth-1' });
+  assert.equal((await f.service.read(symbol)).book.quantityUnit, 'contracts');
+  available = true; f.advance(30001); frame(socket, 'order_book_5', { s: symbol, ts: f.now(), b: [['3000', '0.75']], a: [['3001', '125']] }); const value = await f.service.read(symbol);
+  assert.equal(value.book.quantityUnit, 'base'); assert.equal(value.book.bids[0][1], '0.0075'); assert.equal(value.trades[0].quantity, '0.0075'); assert.equal(value.tradingAvailable, true);
+  assert.equal(f.calls.depth.length, 0);
+});
+
+test('malformed, regressed and wrong-channel public books never replace a validated snapshot', async t => {
+  const f = terminalFixture(); t.after(() => f.service.stop()); await f.service.read(SYMBOL); const socket = f.Socket.instances[0];
+  const good = { s: SYMBOL, ts: NOW + 1, b: [['100', '1'], ['99', '2']], a: [['101', '1']] };
+  frame(socket, 'order_book_5', good);
+  for (const change of [{ ts: NOW }, { ts: [NOW] }, { ts: NOW + 1001 }, { b: [['102', '1']] }, { b: [['100', '0']] }, { b: [['100', '1'], ['100', '2']] }, { a: [] }, { b: Array(6).fill(['100', '1']) }]) frame(socket, 'order_book_5', { ...good, ...change });
+  frame(socket, 'order_book_1', { ...good, b: [['98', '1']] });
+  const value = await f.service.read(SYMBOL); assert.equal(value.book.at, NOW + 1); assert.deepEqual(value.book.bids, good.b);
+});
+
+test('slow native and candle requests do not hold the public terminal response open', async t => {
+  const hold = deferred();
+  const f = terminalFixture({ resolve: async () => { await hold.promise; throw new AppError('慢来源'); } });
+  t.after(async () => { hold.resolve(); await f.service.stop(); });
+  const start = performance.now(); await f.service.read(SYMBOL); assert.ok(performance.now() - start < 1000);
+  assert.equal(f.Socket.instances.length, 1);
+  frame(f.Socket.instances[0], 'ticker', { s: SYMBOL, ts: NOW, bp: '100', ap: '101', lp: '100.5', o: '100' });
+  const value = await f.service.read(SYMBOL); assert.equal(value.status, 'live'); assert.equal(value.ticker.bidPrice, '100'); assert.equal(value.tradingAvailable, false);
+  hold.resolve();
+});
+
+test('mark price uses its own time and Bybit subscribes only to supported depth', async t => {
+  const f = terminalFixture(); t.after(() => f.service.stop()); const symbol = 'BYBIT_FUTURE_BTC_USDT'; await f.service.read(symbol);
+  const socket = f.Socket.instances[0];
+  assert.ok(socket.sent.some(m => m.channel === 'order_book_1')); assert.ok(!socket.sent.some(m => m.channel === 'order_book_5'));
+  const send = (at, price) => socket.emit('message', Buffer.from(JSON.stringify({ channel: 'mark_price', event: 'update', time_ms: at, result: { s: symbol, mp: price } })));
+  send(NOW, '101'); for (const at of [NOW - 1, NOW + 1001, [NOW], undefined]) send(at, '999');
+  assert.equal((await f.service.read(symbol)).ticker.markPrice, '101');
+  f.advance(11000); frame(socket, 'ticker', { s: symbol, ts: f.now(), bp: '100', ap: '101', lp: '100.5' });
+  const value = await f.service.read(symbol); assert.equal(value.status, 'live'); assert.equal(value.ticker.markPrice, null);
 });

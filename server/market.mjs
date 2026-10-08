@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { AppError, defaults, configuration, validateFeed, validSignal, validIdentity, pairKey, quoteKey, contractIdentity,
-  freshQuote, quoteTime, catalogRule, validateBooks, fxRate, referencePrice, settlement, SUPPORTED_VENUES, transferEligibility } from './model.mjs';
-import { loadCatalog, loadFeed, loadDepth, loadFx, resolveCrossexQuote } from './clients.mjs';
+import { AppError, defaults, configuration, validateFeed, validSignal, validManualPair, pairKey, quoteKey, contractIdentity,
+  freshQuote, quoteTime, catalogRule, manualCatalogRule, displayCatalogRule, validateBooks, fxRate, referencePrice, settlement, SUPPORTED_VENUES, transferEligibility } from './model.mjs';
+import { loadCatalog, loadFeed, loadDepth, loadManualDepth, loadFx, resolveCrossexQuote, resolveManualQuote } from './clients.mjs';
 import { D, Decimal } from './money.mjs';
 import { feeSnapshot, roundTripFeeBps } from './fees.mjs';
 
@@ -111,7 +111,9 @@ function validatePreviewValue(leg, latestPrice, fx, now, budget) {
 
 /** Read-only market discovery and order previews. No private client or writer. */
 export function createMarket(store, { catalogReader = loadCatalog, feedReader = loadFeed, depthReader = loadDepth,
-  fxReader = loadFx, identityReader = resolveCrossexQuote, clock = Date.now } = {}) {
+  fxReader = loadFx, identityReader = resolveCrossexQuote,
+  manualIdentityReader = identityReader === resolveCrossexQuote ? resolveManualQuote : identityReader,
+  manualDepthReader = depthReader === loadDepth ? loadManualDepth : depthReader, clock = Date.now } = {}) {
   let feed = null, sourceError = '等待首次读取价差服务', sourceCheckedAt = null, sourceReceivedAt = null, sourceDurationMs = null;
   let catalog = store.get('catalog', { at: 0, items: [] }), catalogError = null, catalogAttempt = -Infinity;
   let sourceFlight = null, catalogFlight = null, generation = 0, stopping = false;
@@ -179,12 +181,16 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     if (!indexedValidSignal(latest, feed, feedIndex, now) || original && !indexedValidSignal(signal, feed, feedIndex, now)) return { transfer, reason: '报价过期、合约身份不明或双腿不同步' };
     return { transfer, reason: '', latest };
   }
-  function ruleFor(q) {
+  function validatedRule(q, validator) {
     if (!catalogAvailable()) throw new AppError('CrossEx 合约目录未就绪或已过期');
     const exchange = typeof q?.exchange === 'string' ? q.exchange.toUpperCase() : null;
     const symbol = q?.crossexSymbol ?? (exchange ? `${exchange}_FUTURE_${q.base}_USDT` : null);
     const match = catalogIndex?.get(catalogKey(symbol, exchange, 'FUTURE'));
-    const r = catalogRule(q, catalogIndex ? match ? [match] : [] : catalog.items);
+    return finishRule(validator(q, catalogIndex ? match ? [match] : [] : catalog.items));
+  }
+  const ruleFor = q => validatedRule(q, catalogRule);
+  const manualRuleFor = q => validatedRule(q, manualCatalogRule);
+  function finishRule(r) {
     // Older directory fixtures omit this new LIMIT-specific bound; production
     // must explicitly supply null when the exchange does not publish a maximum.
     if (r.max_limit_size !== null && !positiveDecimal(r.max_limit_size)) throw new AppError(`${r.symbol} 缺少有效的最大限价数量规则`);
@@ -222,9 +228,9 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
       fx: ['USDC', 'USD'].map(currency => { try { return { currency, state: 'live', ...fxRate(currency, feed?.fx, clock()) }; } catch (e) { return { currency, state: 'unavailable', error: safeMessage(e) }; } }),
       opportunities: includeOpportunities ? candidates() : [] };
   }
-  async function booksAndFx(quotes, requireFx = true) {
+  async function booksAndFx(quotes, requireFx = true, reader = depthReader) {
     const [books, fx] = await Promise.all([
-      Promise.all(quotes.map(q => depthReader(q))),
+      Promise.all(quotes.map(q => reader(q))),
       quotes.every(q => q.quoteCurrency === 'USDT' && settlement(q) === 'USDT') ? null : Promise.resolve().then(fxReader).catch(error => { if (requireFx) throw error; return null; }),
     ]);
     validateBooks(books.length === 1 ? [books[0], books[0]] : books, clock());
@@ -307,17 +313,28 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
   async function resolveSymbol(symbol) {
     if (typeof symbol !== 'string' || symbol.length > 100) throw new AppError('请选择有效的 CrossEx 永续合约');
     await refreshCatalog();
-    const quote = await identityReader(symbol);
-    const rule = ruleFor(quote);
+    const quote = await manualIdentityReader(symbol);
+    const rule = manualRuleFor(quote);
     if (rule.symbol !== symbol) throw new AppError('合约身份不一致');
     return { quote, rule };
+  }
+  async function resolveDisplaySymbol(symbol) {
+    if (typeof symbol !== 'string' || symbol.length > 100) throw new AppError('请选择有效的 CrossEx 永续合约');
+    await refreshCatalog();
+    if (!catalogAvailable()) throw new AppError('CrossEx 合约目录未就绪或已过期');
+    const exchange = symbol.split('_')[0], match = catalogIndex?.get(catalogKey(symbol, exchange, 'FUTURE'));
+    const rule = finishRule(displayCatalogRule(symbol, catalogIndex ? match ? [match] : [] : catalog.items));
+    const [, , base, currency] = symbol.split('_');
+    // This descriptor authorizes CrossEx display only. It deliberately carries
+    // no native symbol, identityVerified flag or quantity conversion factor.
+    return { quote: { exchange: exchange.toLowerCase(), base, quoteCurrency: currency, settlementCurrency: currency, crossexSymbol: symbol }, rule };
   }
   async function manualPlan(requests, source) {
     const c = config(), marketRevision = revision();
     if (c.entryPaused) throw new AppError('新开仓已暂停，平仓仍可使用');
     const resolved = await Promise.all(requests.map(r => resolveSymbol(r.symbol)));
-    if (source === 'pair' && (resolved[0].quote.base !== resolved[1].quote.base || resolved[0].quote.exchange === resolved[1].quote.exchange)) throw new AppError('双腿须为同一基础币的不同交易所合约');
-    const quotes = resolved.map(r => r.quote), { books, fx } = await booksAndFx(quotes);
+    if (source === 'pair' && !validManualPair(resolved[0].quote, resolved[1].quote)) throw new AppError('双腿须为身份可比、同一基础币的不同交易所加密合约');
+    const quotes = resolved.map(r => r.quote), { books, fx } = await booksAndFx(quotes, true, manualDepthReader);
     if (marketRevision !== revision()) throw new AppError('设置已变化，请重新预览', 409);
     const legs = requests.map((request, i) => {
       const { quote: q, rule } = resolved[i], leg = buildLeg(q, request.side, request.side === 'BUY' ? 'LONG' : 'SHORT', rule, books[i]);
@@ -355,7 +372,8 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     const c = config();
     if (revision() !== plan.marketRevision || c.entryPaused) throw new AppError('设置或开仓状态已变化，请重新预览', 409);
     const resolved = await Promise.all(plan.legs.map(l => resolveSymbol(l.symbol)));
-    const { books, fx } = await booksAndFx(resolved.map(r => r.quote));
+    if (plan.source === 'pair' && !validManualPair(resolved[0]?.quote, resolved[1]?.quote)) throw new AppError('双腿合约身份不再可比，请重新预览');
+    const { books, fx } = await booksAndFx(resolved.map(r => r.quote), true, manualDepthReader);
     for (const [i, leg] of plan.legs.entries()) {
       const { quote, rule } = resolved[i];
       if (contractIdentity(quote) !== contractIdentity(leg.quote)) throw new AppError('合约身份已变化，请重新预览');
@@ -370,12 +388,11 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
   async function previewClose(position, requestedQuantity) {
     await refreshCatalog();
     if (!position || typeof position.symbol !== 'string' || !['LONG', 'SHORT'].includes(position.position_side)) throw new AppError('持仓合约或方向无效');
-    const known = feed?.quotes.find(q => (q.crossexSymbol ?? `${q.exchange.toUpperCase()}_FUTURE_${q.base}_USDT`) === position.symbol && validIdentity(q));
-    const q = known || await identityReader(position.symbol), rule = ruleFor(q);
+    const { quote: q, rule } = await resolveSymbol(position.symbol);
     if (requestedQuantity !== undefined && typeof requestedQuantity !== 'string') throw new AppError('平仓数量须为精确小数字符串');
     const held = D(position.position_qty).abs(), quantity = requestedQuantity === undefined ? held.toString() : requestedQuantity;
     if (!positiveDecimal(quantity) || D(quantity).gt(held)) throw new AppError('平仓数量必须大于零且不超过当前持仓');
-    const marketRevision = revision(), { books, fx } = await booksAndFx([q], false);
+    const marketRevision = revision(), { books, fx } = await booksAndFx([q], false, manualDepthReader);
     if (marketRevision !== revision()) throw new AppError('设置已变化，请重新预览', 409);
     const leg = buildLeg(q, position.position_side === 'LONG' ? 'SELL' : 'BUY', position.position_side, rule, books[0]);
     checkPrice(leg.price, rule);
@@ -393,7 +410,9 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     await refreshCatalog();
     if (revision() !== plan.marketRevision) throw new AppError('设置已变化，请重新预览', 409);
     for (const leg of plan.legs) {
-      const rule = ruleFor(leg.quote), { books } = await booksAndFx([leg.quote], false);
+      const { quote, rule } = await resolveSymbol(leg.symbol);
+      if (contractIdentity(quote) !== contractIdentity(leg.quote)) throw new AppError('合约身份已变化，请重新预览');
+      const { books } = await booksAndFx([quote], false, manualDepthReader);
       checkPrice(leg.price, rule);
       checkQuantity(leg.quantity, leg.price, rule);
       const estimate = depthEstimate(books[0], leg.side, leg.quantity, leg.price);
@@ -434,6 +453,6 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     }
     return view({ includeOpportunities: false });
   }
-  return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, previewDirect, previewPair, previewOpen, revalidateOpen, previewClose, revalidateClose, positionsNotional, settings,
+  return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, resolveDisplaySymbol, previewDirect, previewPair, previewOpen, revalidateOpen, previewClose, revalidateClose, positionsNotional, settings,
     async stop() { stopping = true; await Promise.all([sourceFlight, catalogFlight]); } };
 }

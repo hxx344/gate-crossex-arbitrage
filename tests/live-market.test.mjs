@@ -18,6 +18,12 @@ function fixture(t, options = {}) {
   t.after(async () => { await market.stop(); store.close(); assert.ok(directory.startsWith(join(tmpdir(), 'crossex-live-market-'))); rmSync(directory, { recursive: true, force: true }); });
   return { store, market, get identities() { return identities; }, setFeed(x) { current = x; }, setRules(x) { rules = x; }, setDepth(fn) { depth = fn; }, offline() { offline = true; }, advance(ms) { now += ms; current = feed(now); }, now: () => now };
 }
+function manualQuote(exchange, extra = {}) {
+  return quote(exchange, epoch, { symbol: { binance: 'BTCUSDT', bybit: 'BTCUSDT', gate: 'BTC_USDT', okx: 'BTC-USDT-SWAP' }[exchange],
+    rawBase: 'BTC', settlementCurrency: 'USDT', collateralCurrency: 'USDT', counterCurrency: 'USDT', contractKind: 'linear',
+    crossexSymbol: `${exchange.toUpperCase()}_FUTURE_BTC_USDT`, identityScope: 'manual', nativeUnit: '1',
+    identitySource: 'exchange-instrument-metadata', comparable: true, ...extra });
+}
 
 test('manual market never uses saved paper positions or enabled automation', async t => {
   const f = fixture(t);
@@ -267,4 +273,70 @@ test('configuration changes affect candidate decisions immediately and connectio
   assert.equal(disconnected.source.quoteCount, 0); assert.equal(disconnected.source.updatedAt, null); assert.equal(disconnected.source.state, 'offline');
   assert.ok(disconnected.venues.every(v => v.quoteCount === 0)); assert.deepEqual(f.market.view().opportunities, []);
   await f.market.refreshSource(); assert.equal(f.market.view().opportunities[0].eligible, true);
+});
+
+test('manual direct, pair and close use native identity and depth readers independently of Monitor', async t => {
+  let identities = 0, depths = 0;
+  const f = fixture(t, { identityReader: async () => { throw new Error('strict identity unavailable'); }, depthReader: async () => { throw new Error('strict depth unavailable'); },
+    manualIdentityReader: async symbol => { identities++; return manualQuote(symbol.startsWith('GATE_') ? 'gate' : 'okx'); },
+    manualDepthReader: async q => { depths++; return book(q, epoch); } });
+  f.offline(); f.setRules(['GATE', 'OKX'].map(exchange => ({ ...catalog[0], exchange_type: exchange, symbol: `${exchange}_FUTURE_BTC_USDT`, max_limit_size: '10000' })));
+  const direct = await f.market.previewDirect({ symbol: 'GATE_FUTURE_BTC_USDT', side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '100', timeInForce: 'GTC' });
+  await f.market.revalidateOpen(direct);
+  const pair = await f.market.previewPair({ longSymbol: 'GATE_FUTURE_BTC_USDT', shortSymbol: 'OKX_FUTURE_BTC_USDT', quantity: '0.25' });
+  await f.market.revalidateOpen(pair);
+  const close = await f.market.previewClose({ symbol: 'GATE_FUTURE_BTC_USDT', position_side: 'LONG', position_qty: '0.25' });
+  await f.market.revalidateClose(close);
+  assert.equal(identities, 8); assert.equal(depths, 8);
+});
+
+test('manual confirmation rejects changed native units, asset class and identity scope', async t => {
+  let current = manualQuote('binance');
+  const f = fixture(t, { manualIdentityReader: async () => ({ ...current }) });
+  const plan = await f.market.previewDirect({ symbol: current.crossexSymbol, side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '98', timeInForce: 'GTC' });
+  for (const changes of [{ nativeUnit: '2' }, { assetClass: 'commodity', comparable: false }, { identityScope: 'comparable' }]) {
+    current = { ...manualQuote('binance'), ...changes };
+    await assert.rejects(f.market.revalidateOpen(plan), /身份已变化/);
+  }
+  current = manualQuote('binance'); await f.market.revalidateOpen(plan);
+});
+
+test('close preview and confirmation re-resolve native identity even when Monitor has a saved matching quote', async t => {
+  let current = manualQuote('binance'), identities = 0;
+  const f = fixture(t, { manualIdentityReader: async () => { identities++; return { ...current }; } });
+  await f.market.refresh();
+  const plan = await f.market.previewClose({ symbol: current.crossexSymbol, position_side: 'LONG', position_qty: '0.25' });
+  assert.equal(identities, 1); assert.equal(plan.legs[0].quote.identityScope, 'manual');
+  current = { ...current, nativeUnit: '0.01' };
+  await assert.rejects(f.market.revalidateClose(plan), /身份已变化/); assert.equal(identities, 2);
+  current = { ...current, nativeUnit: '1', identityVerified: false };
+  await assert.rejects(f.market.revalidateClose(plan), /未确认/); assert.equal(identities, 3);
+});
+
+test('a positive noncrypto native identity permits only direct trading and cannot become an equal-base pair', async t => {
+  let second = manualQuote('okx', { assetClass: 'commodity', comparable: false });
+  const f = fixture(t, { manualIdentityReader: async symbol => symbol.startsWith('GATE_') ? manualQuote('gate') : { ...second } });
+  f.setRules(['GATE', 'OKX'].map(exchange => ({ ...catalog[0], exchange_type: exchange, symbol: `${exchange}_FUTURE_BTC_USDT`, max_limit_size: '10000' })));
+  const direct = await f.market.previewDirect({ symbol: second.crossexSymbol, side: 'BUY', quantity: '0.25', orderType: 'LIMIT', price: '100', timeInForce: 'GTC' });
+  await f.market.revalidateOpen(direct);
+  const request = { longSymbol: 'GATE_FUTURE_BTC_USDT', shortSymbol: second.crossexSymbol, quantity: '0.25' };
+  await assert.rejects(f.market.previewPair(request), /身份可比/);
+  second = manualQuote('okx'); const pair = await f.market.previewPair(request);
+  second = { ...second, assetClass: 'commodity', comparable: false };
+  await assert.rejects(f.market.revalidateOpen(pair), /不再可比/);
+});
+
+test('display resolution requires an exact live CrossEx rule but never requires native identity', async t => {
+  let nativeReads = 0;
+  const f = fixture(t, { manualIdentityReader: async () => { nativeReads++; throw new Error('native unavailable'); } });
+  const symbol = 'OKX_FUTURE_CL_USDC', rule = { ...catalog[0], exchange_type: 'OKX', symbol, max_limit_size: null, contract_size: null };
+  f.setRules([rule]); const resolved = await f.market.resolveDisplaySymbol(symbol);
+  assert.deepEqual(resolved.quote, { exchange: 'okx', base: 'CL', quoteCurrency: 'USDC', settlementCurrency: 'USDC', crossexSymbol: symbol });
+  assert.equal(resolved.rule.symbol, symbol); assert.equal(nativeReads, 0);
+  await assert.rejects(f.market.resolveSymbol(symbol), /native unavailable/); assert.equal(nativeReads, 1);
+  for (const changes of [{ state: 'suspend' }, { tick_size: '0' }, { exchange_type: 'GATE' }, { delist_time: '1' }]) {
+    f.advance(300000); f.setRules([{ ...rule, ...changes }]);
+    await assert.rejects(f.market.resolveDisplaySymbol(symbol), /未在 CrossEx|规则/);
+  }
+  assert.equal(nativeReads, 1);
 });
