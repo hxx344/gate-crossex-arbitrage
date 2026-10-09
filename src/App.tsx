@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, ArrowLeftRight, RefreshCw, LayoutDashboard, CandlestickChart, ListOrdered, Settings2, ArrowUpRight } from 'lucide-react';
 import { createLatestRead } from './latest-read';
 import { createServerClock, sourceIsStale, STATE_POLL_MS } from './freshness';
-import { cleanHubQuery, hubChanged, hubNavigate, useHubBridge } from './hub-bridge';
+import { cleanHubQuery, hubChanged, hubNavigate, observeReadWake, readPollDelay, useHubBridge } from './hub-bridge';
 import type { LiveBootstrap, LiveExecution, LiveOrder, LivePreview, LiveState, PreviewInput } from './live-types';
 import { BOOTSTRAP_REFRESH_MS, latestBootstrap, needsCatalog, parseBootstrap, readRetryDelay, stateReadPath, validCsrf } from './live-loading';
 import { time } from './display';
@@ -41,13 +41,13 @@ export default function App() {
     if (!saved && next) return false;
     pendingRef.current = next; setPendingRequest(next); return true;
   }, [requestStore]);
-  const lifecycle = useRef({ active: hub.active, mutating: false, tab }); lifecycle.current.active = hub.active; lifecycle.current.tab = tab;
+  const lifecycle = useRef({ active: hub.readActive, mutating: false, tab }); lifecycle.current.active = hub.readActive; lifecycle.current.tab = tab;
   const serverClock = useRef(createServerClock());
-  const instruments = useInstruments(hub.active && needsCatalog(tab));
+  const instruments = useInstruments(hub.readActive && needsCatalog(tab), hub.background);
   const bootstrapFailures = useRef(0), stateFailures = useRef(0);
   const bootstrapReader = useRef<ReturnType<typeof createLatestRead<LiveBootstrap>> | null>(null);
   if (!bootstrapReader.current) bootstrapReader.current = createLatestRead<LiveBootstrap>({
-    canRead: () => lifecycle.current.active && !document.hidden && !lifecycle.current.mutating,
+    canRead: () => lifecycle.current.active && !lifecycle.current.mutating,
     load: async signal => {
       setBootstrapLoading(true);
       const response = await fetch('/api/bootstrap', { signal, cache: 'no-store' });
@@ -65,20 +65,20 @@ export default function App() {
     let timer: ReturnType<typeof setTimeout> | undefined, epoch = 0, stopped = false;
     const synchronize = () => {
       const version = ++epoch; clearTimeout(timer); cancelBootstrap();
-      if (!loadBootstrap || !hub.active || busy || document.hidden || stopped) return;
+      if (!loadBootstrap || !hub.readActive || busy || stopped) return;
       const poll = async () => {
         if (version !== epoch || stopped) return;
         await refreshBootstrap();
-        if (version === epoch && !stopped) timer = setTimeout(poll, bootstrapFailures.current ? readRetryDelay(bootstrapFailures.current) : BOOTSTRAP_REFRESH_MS);
+        if (version === epoch && !stopped) timer = setTimeout(poll, readPollDelay(bootstrapFailures.current ? readRetryDelay(bootstrapFailures.current) : BOOTSTRAP_REFRESH_MS, hub.background));
       };
       void poll();
     };
-    synchronize(); document.addEventListener('visibilitychange', synchronize);
-    return () => { stopped = true; epoch++; clearTimeout(timer); cancelBootstrap(); document.removeEventListener('visibilitychange', synchronize); };
-  }, [hub.active, loadBootstrap, busy, bootstrapRevision, refreshBootstrap, cancelBootstrap]);
+    synchronize(); const stopWake = observeReadWake(synchronize);
+    return () => { stopped = true; epoch++; clearTimeout(timer); cancelBootstrap(); stopWake(); };
+  }, [hub.readActive, hub.background, loadBootstrap, busy, bootstrapRevision, refreshBootstrap, cancelBootstrap]);
   const reader = useRef<ReturnType<typeof createLatestRead<LiveState & { requestStartedAt: number; requestedTab: Tab }>> | null>(null);
   if (!reader.current) reader.current = createLatestRead<LiveState & { requestStartedAt: number; requestedTab: Tab }>({
-    canRead: () => lifecycle.current.active && lifecycle.current.tab !== 'settings' && !document.hidden && !lifecycle.current.mutating,
+    canRead: () => lifecycle.current.active && lifecycle.current.tab !== 'settings' && !lifecycle.current.mutating,
     load: async signal => {
       const requestStartedAt = performance.now(), requestedTab = lifecycle.current.tab;
       const response = await fetch(stateReadPath(requestedTab), { signal, cache: 'no-store' });
@@ -98,15 +98,16 @@ export default function App() {
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | undefined, epoch = 0, stopped = false;
     const synchronize = () => {
+      setNow(serverClock.current.now());
       const version = ++epoch; clearTimeout(timer); cancelRead();
-      if (!hub.active || tab === 'settings' || document.hidden || stopped) return;
-      const poll = async () => { if (version !== epoch || stopped) return; const startedAt = performance.now(); await refresh(); if (version === epoch && !stopped) timer = setTimeout(poll, stateFailures.current ? readRetryDelay(stateFailures.current) : Math.max(0, STATE_POLL_MS - (performance.now() - startedAt))); };
+      if (!hub.readActive || tab === 'settings' || stopped) return;
+      const poll = async () => { if (version !== epoch || stopped) return; const startedAt = performance.now(); await refresh(); if (version === epoch && !stopped) timer = setTimeout(poll, readPollDelay(stateFailures.current ? readRetryDelay(stateFailures.current) : Math.max(0, STATE_POLL_MS - (performance.now() - startedAt)), hub.background)); };
       void poll();
     };
-    const ageTimer = setInterval(() => { if (hub.active && !document.hidden) setNow(serverClock.current.now()); }, 1000);
-    synchronize(); document.addEventListener('visibilitychange', synchronize);
-    return () => { stopped = true; epoch++; clearTimeout(timer); clearInterval(ageTimer); cancelRead(); document.removeEventListener('visibilitychange', synchronize); };
-  }, [hub.active, tab, refresh, cancelRead]);
+    const ageTimer = setInterval(() => { if (hub.readActive && !document.hidden) setNow(serverClock.current.now()); }, 1000);
+    synchronize(); const stopWake = observeReadWake(synchronize);
+    return () => { stopped = true; epoch++; clearTimeout(timer); clearInterval(ageTimer); cancelRead(); stopWake(); };
+  }, [hub.readActive, hub.background, tab, refresh, cancelRead]);
   useEffect(() => {
     const restore = () => {
       const params = new URL(location.href).searchParams;
@@ -225,8 +226,8 @@ export default function App() {
       {extraAlerts.length > 0 && <div className="notice warning" role="status"><AlertCircle size={15}/><span>{extraAlerts.join(' ')}</span></div>}
       {state.config.entryPaused && (tab === 'trade' || tab === 'hedge') && <p className="inline-state warning">新开仓已暂停，可在设置中恢复；仍可手动平仓和撤单。</p>}
       {tab === 'positions' && <><div className="view-heading portfolio-heading"><div><span className="eyebrow">PORTFOLIO</span><h2>投资组合</h2><p>统一保证金概览与跨交易所真实持仓</p></div><div className="portfolio-count"><strong>{new Set(live.positions.map(p => p.baseCurrency || p.symbol)).size}</strong><span>个币种 <b>·</b> {live.positions.length} 条持仓腿</span></div></div><AccountOverview live={live}/><PortfolioPanel live={live} instruments={instruments.items} disabled={tradingDisabled} close={positions => previewOrder({ kind: 'close', positions })}/></>}
-      {tab === 'trade' && <TradingTerminal instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.active} disabled={openingDisabled} preview={previewOrder}/>}
-      {tab === 'hedge' && <ManualHedgePanel key={[search, pair.longExchange, pair.shortExchange].join(':')} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.active} disabled={openingDisabled} opportunities={state.opportunities} now={now} initial={{ base: search, ...pair }} monitorStale={marketStale} preview={previewOrder}/>}
+      {tab === 'trade' && <TradingTerminal instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} preview={previewOrder}/>}
+      {tab === 'hedge' && <ManualHedgePanel key={[search, pair.longExchange, pair.shortExchange].join(':')} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} opportunities={state.opportunities} now={now} initial={{ base: search, ...pair }} monitorStale={marketStale} preview={previewOrder}/>}
       {tab === 'orders' && <><div className="view-heading"><div><span className="eyebrow">ORDERS & EXECUTIONS</span><h2>订单与操作记录</h2><p>核对真实成交状态，管理尚未成交的委托</p></div></div><HistoryPanel live={live} disabled={tradingDisabled} querying={busy} query={() => void queryAccount()} cancel={setCancelOrder}/></>}
 
     </>}

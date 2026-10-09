@@ -25,12 +25,28 @@ export function observeNetworkActivity(update: () => void, source: Pick<Window, 
   source.addEventListener('online', update); source.addEventListener('offline', update);
   return () => { source.removeEventListener('online', update); source.removeEventListener('offline', update); };
 }
+export const BACKGROUND_POLL_MS = 30_000;
+export function readPollDelay(delay: number, background: boolean) { return background || document.hidden ? Math.max(BACKGROUND_POLL_MS, delay) : delay; }
+export function observeReadWake(update: () => void) {
+  document.addEventListener('visibilitychange', update);
+  window.addEventListener('focus', update); window.addEventListener('pageshow', update);
+  return () => { document.removeEventListener('visibilitychange', update); window.removeEventListener('focus', update); window.removeEventListener('pageshow', update); };
+}
 export function useHubBridge(projectId: HubProject) {
-  const [state, setState] = useState(() => ({ connected: false, active: typeof window === 'undefined' || (!trustedHubOrigin(window.location, window.parent !== window) && !document.hidden && navigator.onLine) }));
+  const [state, setState] = useState(() => {
+    const standalone = typeof window === 'undefined' || !trustedHubOrigin(window.location, window.parent !== window);
+    const online = typeof navigator === 'undefined' || navigator.onLine !== false;
+    const background = typeof document !== 'undefined' && document.hidden;
+    return { connected: false, active: standalone && online && !background, readActive: standalone && online, background };
+  });
   useEffect(() => {
     const origin = trustedHubOrigin(window.location, window.parent !== window);
-    let hostActive = !origin, visible = true;
-    const update = () => setState({ connected, active: hostActive && visible && !document.hidden && navigator.onLine });
+    let hostActive = !origin, visible = true, backgroundUpdates = !origin;
+    const update = () => {
+      const active = hostActive && visible && !document.hidden && navigator.onLine !== false;
+      const next = { connected, active, readActive: navigator.onLine !== false && (active || backgroundUpdates), background: !hostActive || !visible || document.hidden };
+      setState(previous => Object.keys(next).every(key => previous[key as keyof typeof next] === next[key as keyof typeof next]) ? previous : next);
+    };
     const message = (event: MessageEvent) => {
       if (!origin || event.source !== window.parent || event.origin !== origin) return;
       const value = event.data;
@@ -38,7 +54,7 @@ export function useHubBridge(projectId: HubProject) {
       if (value.type === 'ready' && value.role === 'host') {
         targetOrigin = origin; connected = true; update();
         post({ type: 'ready', role: 'module', capabilities: ['activity', 'navigate', 'changed'] });
-      } else if (connected && value.type === 'activity' && typeof value.active === 'boolean') { hostActive = value.active; update(); }
+      } else if (connected && value.type === 'activity' && typeof value.active === 'boolean') { hostActive = value.active; backgroundUpdates = value.backgroundUpdates === true; update(); }
       else if (connected && value.type === 'navigate' && value.projectId === projectId) {
         const query = cleanHubQuery(value.query); if (!query) return;
         const url = new URL(window.location.href);

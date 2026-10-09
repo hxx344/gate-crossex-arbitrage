@@ -16,8 +16,8 @@ import { opportunityStaleReason } from './freshness';
 import { direction, time, venue } from './display';
 const D = Decimal.clone({ precision: 100 });
 
-export default function ManualHedgePanel({ instruments, catalogError, live, budget, active, disabled, opportunities, now, initial, monitorStale, preview }: {
-  instruments: Instrument[]; catalogError: string; live: LiveView; budget: number; active: boolean; disabled: boolean; opportunities: Opportunity[]; now: number;
+export default function ManualHedgePanel({ instruments, catalogError, live, budget, active, background, disabled, opportunities, now, initial, monitorStale, preview }: {
+  instruments: Instrument[]; catalogError: string; live: LiveView; budget: number; active: boolean; background: boolean; disabled: boolean; opportunities: Opportunity[]; now: number;
   initial: { base: string; longExchange?: string; shortExchange?: string }; monitorStale: boolean; preview: (input: PreviewInput) => Promise<boolean>;
 }) {
   const [base, setBase] = useState(initial.base || 'BTC'), [longSymbol, setLongSymbol] = useState(''), [shortSymbol, setShortSymbol] = useState('');
@@ -36,7 +36,7 @@ export default function ManualHedgePanel({ instruments, catalogError, live, budg
     if (next !== base) { setBase(next); setQuantity(''); }
   }, [bases, base]);
   const long = instruments.find(i => i.symbol === longSymbol), short = instruments.find(i => i.symbol === shortSymbol);
-  const a = useMarket(longSymbol, '5m', active), b = useMarket(shortSymbol, '5m', active);
+  const a = useMarket(longSymbol, '5m', active, background), b = useMarket(shortSymbol, '5m', active, background);
   const sameCurrency = !!long && !!short && long.quoteCurrency === short.quoteCurrency;
   const spread = sameCurrency ? nativeSpread(a.data?.ticker?.askPrice, b.data?.ticker?.bidPrice) : null;
   const ready = !!long && !!short && long.base === base && short.base === base && long.exchange !== short.exchange && positiveQuantity(quantity) && a.data?.status === 'live' && b.data?.status === 'live' && a.data?.tradingAvailable !== false && b.data?.tradingAvailable !== false;

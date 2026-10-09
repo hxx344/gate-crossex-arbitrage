@@ -1,4 +1,4 @@
-/** One active read; superseded, hidden, cancelled and timed-out responses cannot update the UI. */
+/** One active read; superseded, inactive, cancelled and timed-out responses cannot update the UI. */
 export function createLatestRead<T>({ canRead, load, onData, onError, timeoutMs = 12_000 }: {
   canRead: () => boolean; load: (signal: AbortSignal) => Promise<T>;
   onData: (value: T) => void; onError: (error: unknown) => void; timeoutMs?: number;
