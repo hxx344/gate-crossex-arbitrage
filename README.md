@@ -20,7 +20,9 @@ sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-
 sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in market-spread-monitor/main/deploy/install.sh gate-crossex-arbitrage/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
 ```
 
-安装器使用 Node.js 24.15.0+ 的 24.x 运行时，默认下载 GitHub CI 已验证并发布的部署包，固定提交地址并校验 SHA-256。服务器不运行 npm 安装、类型检查、测试或前端编译；包内包含后端、页面及锁定的 ws/decimal.js 运行依赖。没有变化且健康时跳过应用下载和重启，已有配置与数据库保留。CI 尚未发布新包时使用上次成功发布版本；首次没有可用包则停止。详见[部署与恢复](docs/deployment.md)。
+安装器使用 Node.js 24.15.0+ 的 24.x 运行时，默认下载经过 CI 验证并明确发布的正式部署包，固定提交地址并校验 SHA-256。服务器不运行 npm 安装、类型检查、测试或前端编译；包内包含后端、页面及锁定的 ws/decimal.js 运行依赖。没有变化且健康时跳过应用下载和重启，已有配置与数据库保留。尚未发布新正式版时使用现有正式版；首次没有可用正式包则停止。详见[部署与恢复](docs/deployment.md)。
+
+`main` CI 全部通过后，只发布 `deploy-<完整提交号>` 候选 Release（`prerelease`），不改变当前正式版。发布者在 GitHub Actions 选择 **[Publish stable release](.github/workflows/promote-release.yml)**，分支选 `main`，在 `commit` 中填写已通过本仓库 CI 的完整 40 位提交 SHA 后运行；核验清单和部署包后，候选才晋级为最新正式版。默认安装及工作台前端更新只使用正式版，未晋级的候选不会自动安装。
 
 开发排查可显式使用 `sudo env PROJECT_DEPLOY_MODE=source bash install.sh` 恢复原源码部署。`PROJECT_DEPLOY_TESTS=1` 或总部署 `--with-tests` 只在 source 模式补测；CI 模式不在服务器重复测试。
 

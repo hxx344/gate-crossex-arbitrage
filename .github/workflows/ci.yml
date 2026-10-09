@@ -53,6 +53,7 @@ jobs:
         run: |
           python3 deploy/test-release.py -v
           python3 deploy/test-publish.py -v
+          python3 deploy/test-promote.py -v
       - name: Check installer syntax
         run: |
           bash -n install.sh

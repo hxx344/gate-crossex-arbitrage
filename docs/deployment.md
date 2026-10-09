@@ -27,11 +27,11 @@ NODE_ENV=production
 
 修改后重复运行安装命令。`DATA_DIR` 必须在 `/var/lib/gate-crossex-arbitrage`、`/srv/gate-crossex-arbitrage/` 子目录或 `/opt/gate-crossex-arbitrage-data` 范围内；更换目录前迁移完整数据，不会自动搬迁。
 
-默认 `PROJECT_DEPLOY_MODE=ci`：GitHub 完成必要类型检查、测试、构建、解包启动与安装恢复验收后发布 `deploy-<完整提交号>`。清单记录仓库、提交、架构和包的 SHA-256，下载固定到清单对应标签；已发布的同提交包不覆盖。包内包含 `server/`、`dist/`、`package.json`、锁定的 ws/decimal.js 以及许可和来源说明。服务器保留 Node 运行环境准备、配置与健康检查，不安装前端开发依赖或编译。
+默认 `PROJECT_DEPLOY_MODE=ci`，只下载正式运行包。GitHub 完成必要类型检查、测试、构建、解包启动与安装恢复验收后，仅发布 `deploy-<完整提交号>` 候选（`prerelease`）；发布者在 **Publish stable release** 工作流选择 `main`，输入已通过本仓库 CI 的完整 40 位提交 SHA，核验后晋级为最新正式版。清单记录仓库、提交、架构和包的 SHA-256，下载固定到正式清单对应标签；已发布的同提交包不覆盖。包内包含 `server/`、`dist/`、`package.json`、锁定的 ws/decimal.js 以及许可和来源说明。服务器保留 Node 运行环境准备、配置与健康检查，不安装前端开发依赖或编译。
 
 安装器按实际运行内容判断更新。无变化且健康时跳过下载及重启；仅文档或测试提交不替换当前产物；配置或 Node 环境变化复用当前程序目录，再重启和检查健康。新的应用内容先完整校验并解包到独立目录，服务用户对代码和依赖只读。坏包、错误版本或下载失败不会切换服务或写入成功状态。已检查的发布提交与 `.source-sha` 中的实际运行产物版本分开记录。
 
-Ubuntu CI 覆盖源码部署迁移到 CI、首次安装、无变化跳过、包校验和恢复。启动失败恢复旧链接、systemd 和上次健康配置；失败的新环境文件另存 `.failed-时间-PID`。不会回滚或删除数据库。CI 运行中或失败时继续使用上次成功发布版本；首次无包则明确停止。
+Ubuntu CI 覆盖源码部署迁移到 CI、首次安装、无变化跳过、包校验和恢复。启动失败恢复旧链接、systemd 和上次健康配置；失败的新环境文件另存 `.failed-时间-PID`。不会回滚或删除数据库。CI 运行中、失败或候选尚未晋级时继续使用现有正式版；首次无正式包则明确停止。
 
 仅开发排查需要源码部署时使用 `sudo env PROJECT_DEPLOY_MODE=source bash install.sh`，仍支持已有依赖、验证及构建缓存。源码模式默认不跑完整行为测试，设置 `PROJECT_DEPLOY_TESTS=1` 或总部署 `--with-tests` 可补测；这些选项在 CI 模式不重复测试。前端编译参数由 CI 决定，现有环境文件仍用于服务运行配置。
 
