@@ -8,7 +8,7 @@
 | `/var/lib/gate-crossex-arbitrage/` | SQLite 数据库和凭据加密密钥 |
 | `/opt/gate-crossex-arbitrage/current` | 当前程序版本 |
 | `/opt/gate-crossex-arbitrage/previous` | 上一个健康版本 |
-| `/opt/gate-crossex-arbitrage/cache` | 依赖、构建与验证缓存 |
+| `/opt/gate-crossex-arbitrage/cache` | CI 部署包缓存；原源码模式缓存继续保留 |
 | `/opt/gate-crossex-arbitrage/.last-successful.env` | root 可读的上次健康配置 |
 | `/etc/systemd/system/gate-crossex-arbitrage.service` | 自动管理的服务 |
 
@@ -27,13 +27,13 @@ NODE_ENV=production
 
 修改后重复运行安装命令。`DATA_DIR` 必须在 `/var/lib/gate-crossex-arbitrage`、`/srv/gate-crossex-arbitrage/` 子目录或 `/opt/gate-crossex-arbitrage-data` 范围内；更换目录前迁移完整数据，不会自动搬迁。
 
-安装器分别比较依赖、类型检查、可选行为测试、前端构建、运行代码和服务配置。服务器默认 `PROJECT_DEPLOY_TESTS=0`，跳过完整行为测试；CI 继续运行。需要补测时使用 `sudo env PROJECT_DEPLOY_TESTS=1 bash install.sh`，聚合总部署可加 `--with-tests`；其他值会在安装前报错。跳过不会写入测试成功缓存，同一版本事后补测会执行缺失的测试并缓存成功结果，不重建、不重启；测试模式不进入构建或运行版本指纹。
+默认 `PROJECT_DEPLOY_MODE=ci`：GitHub 完成必要类型检查、测试、构建、解包启动与安装恢复验收后发布 `deploy-<完整提交号>`。清单记录仓库、提交、架构和包的 SHA-256，下载固定到清单对应标签；已发布的同提交包不覆盖。包内包含 `server/`、`dist/`、`package.json`、锁定的 ws/decimal.js 以及许可和来源说明。服务器保留 Node 运行环境准备、配置与健康检查，不安装前端开发依赖或编译。
 
-无变化且健康时快速完成；仅文档变化不验证、不构建、不重启；仅测试变化默认只记录已检查提交，显式开启时才在隔离目录补测。后端变化复用类型检查和前端产物，只在开启测试时运行行为测试；配置变化直接复用当前程序目录。安装器和 CI 在独立类型检查后运行纯构建 `build:bundle`，不重复执行类型检查；开发默认 `npm run build` 仍包含类型检查。首次采用新缓存格式会保守检查类型并构建一次。
+安装器按实际运行内容判断更新。无变化且健康时跳过下载及重启；仅文档或测试提交不替换当前产物；配置或 Node 环境变化复用当前程序目录，再重启和检查健康。新的应用内容先完整校验并解包到独立目录，服务用户对代码和依赖只读。坏包、错误版本或下载失败不会切换服务或写入成功状态。已检查的发布提交与 `.source-sha` 中的实际运行产物版本分开记录。
 
-依赖安装后由 root 持有且禁止其他用户写入，隔离验证与构建目录只链接顶层包，Vite 临时文件留在该目录。生产发布通过软链接使用同一只读依赖缓存，保留 ws、decimal.js 等运行依赖；版本清理不删除这些依赖缓存。无需复制依赖树或反复执行递归权限调整。构建、验证成功后分别原子记录缓存；测试或构建失败不切换现有服务。已检查的远端提交与 `.source-sha` 中的实际运行产物版本分开记录，文档和测试变化不会改写旧产物版本。
+Ubuntu CI 覆盖源码部署迁移到 CI、首次安装、无变化跳过、包校验和恢复。启动失败恢复旧链接、systemd 和上次健康配置；失败的新环境文件另存 `.failed-时间-PID`。不会回滚或删除数据库。CI 运行中或失败时继续使用上次成功发布版本；首次无包则明确停止。
 
-Ubuntu CI 同时覆盖隔离安装状态机和真实非 root 的只读依赖构建、后端包解析；Windows 运行应用类型检查、测试和构建。新程序启动失败恢复旧链接、systemd 和上次健康配置；失败的新环境文件另存 `.failed-时间-PID`。不会回滚或删除数据库。
+仅开发排查需要源码部署时使用 `sudo env PROJECT_DEPLOY_MODE=source bash install.sh`，仍支持已有依赖、验证及构建缓存。源码模式默认不跑完整行为测试，设置 `PROJECT_DEPLOY_TESTS=1` 或总部署 `--with-tests` 可补测；这些选项在 CI 模式不重复测试。前端编译参数由 CI 决定，现有环境文件仍用于服务运行配置。
 
 查看状态：
 

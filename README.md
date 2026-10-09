@@ -20,9 +20,9 @@ sudo bash -c 'set -e; command -v curl >/dev/null || { apt-get update -qq && apt-
 sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in market-spread-monitor/main/deploy/install.sh gate-crossex-arbitrage/main/install.sh project-aggregation/main/install.sh; do printf "\n更新 %s\n" "$path"; curl -fsSL "https://raw.githubusercontent.com/hxx344/$path" -o "$f"; bash "$f"; done'
 ```
 
-安装器使用 Node.js 24.15.0+ 的 24.x 运行时，按内容与环境缓存依赖、检查和构建。没有变化时跳过下载、安装、构建和重启；失败恢复前一程序与健康配置，数据不回滚。详见[部署与恢复](docs/deployment.md)。
+安装器使用 Node.js 24.15.0+ 的 24.x 运行时，默认下载 GitHub CI 已验证并发布的部署包，固定提交地址并校验 SHA-256。服务器不运行 npm 安装、类型检查、测试或前端编译；包内包含后端、页面及锁定的 ws/decimal.js 运行依赖。没有变化且健康时跳过应用下载和重启，已有配置与数据库保留。CI 尚未发布新包时使用上次成功发布版本；首次没有可用包则停止。详见[部署与恢复](docs/deployment.md)。
 
-服务器部署默认跳过完整行为测试，GitHub CI 继续执行；类型检查、构建、配置和健康检查保留。需要在服务器补测时，下载脚本后用 `sudo env PROJECT_DEPLOY_TESTS=1 bash install.sh` 执行；使用聚合工作台的 `install-all.sh` 时加 `--with-tests` 即可。相同内容的成功测试结果仍可复用，事后补测不会重建或重启未变化的服务。
+开发排查可显式使用 `sudo env PROJECT_DEPLOY_MODE=source bash install.sh` 恢复原源码部署。`PROJECT_DEPLOY_TESTS=1` 或总部署 `--with-tests` 只在 source 模式补测；CI 模式不在服务器重复测试。
 
 ## 连接与操作
 
