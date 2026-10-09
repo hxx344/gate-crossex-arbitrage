@@ -22,6 +22,8 @@ sudo bash -c 'set -e; f=$(mktemp); trap '\''rm -f "$f"'\'' EXIT; for path in mar
 
 安装器使用 Node.js 24.15.0+ 的 24.x 运行时，按内容与环境缓存依赖、检查和构建。没有变化时跳过下载、安装、构建和重启；失败恢复前一程序与健康配置，数据不回滚。详见[部署与恢复](docs/deployment.md)。
 
+服务器部署默认跳过完整行为测试，GitHub CI 继续执行；类型检查、构建、配置和健康检查保留。需要在服务器补测时，下载脚本后用 `sudo env PROJECT_DEPLOY_TESTS=1 bash install.sh` 执行；使用聚合工作台的 `install-all.sh` 时加 `--with-tests` 即可。相同内容的成功测试结果仍可复用，事后补测不会重建或重启未变化的服务。
+
 ## 连接与操作
 
 1. 工作台项目使用 `http://127.0.0.1:3200`、`standard` 适配器和 `proxy` 访问。用户名为 `admin`，首次密码在 `sudo journalctl -u gate-crossex-arbitrage --no-pager -n 30` 中查看并保存到工作台。
