@@ -48,11 +48,11 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     for (const q of feed?.quotes || []) { quoteIndex.set(quoteKey(q), q); venueCounts.set(q.exchange, (venueCounts.get(q.exchange) || 0) + 1); }
   }
   function historyView(knownVersion) {
-    const eventId = store.db.prepare('SELECT coalesce(max(id),0) AS id FROM events').get().id;
-    const closed = store.db.prepare("SELECT count(*) AS count,max(json_extract(json,'$.closedAt')) AS at FROM positions WHERE status='closed'").get();
+    const eventId = store.prepare('SELECT coalesce(max(id),0) AS id FROM events').get().id;
+    const closed = store.prepare("SELECT count(*) AS count,max(json_extract(json,'$.closedAt')) AS at FROM positions WHERE status='closed'").get();
     const version = [historyEpoch, eventId, closed.count, closed.at || 0, store.get('historyRevision', 0)].join(':');
     if (version === knownVersion) return { historyVersion: version };
-    if (cachedHistory?.historyVersion !== version) cachedHistory = { historyVersion: version, history: store.positions('closed', 200).map(publicPosition), events: store.db.prepare('SELECT at,message FROM events ORDER BY id DESC LIMIT 100').all(), analytics: analyticsView(store, config()) };
+    if (cachedHistory?.historyVersion !== version) cachedHistory = { historyVersion: version, history: store.positions('closed', 200).map(publicPosition), events: store.prepare('SELECT at,message FROM events ORDER BY id DESC LIMIT 100').all(), analytics: analyticsView(store, config()) };
     return cachedHistory;
   }
   // Simulation actions remain serialized; read-only source refreshes have their own lane.
@@ -214,13 +214,13 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
   }
   function requestResult(requestId, fingerprint) {
     if (typeof requestId !== 'string' || !/^[a-zA-Z0-9:_-]{8,160}$/.test(requestId)) throw new AppError('缺少有效的请求编号');
-    const row = store.db.prepare('SELECT * FROM requests WHERE id=?').get(requestId);
+    const row = store.prepare('SELECT * FROM requests WHERE id=?').get(requestId);
     if (row && row.fingerprint !== fingerprint) throw new AppError('请求编号已用于其他操作', 409);
     if (!row) return null;
     const value = JSON.parse(row.result);
     return value.executionRef ? store.findExecution(value.executionRef) : value;
   }
-  const saveResult = (id, fingerprint, result) => store.db.prepare('INSERT INTO requests VALUES (?,?,?)').run(id, fingerprint, JSON.stringify(result));
+  const saveResult = (id, fingerprint, result) => store.prepare('INSERT INTO requests VALUES (?,?,?)').run(id, fingerprint, JSON.stringify(result));
   async function open(signalId, requestId) {
     const fingerprint = `open:${signalId}`, previous = requestResult(requestId, fingerprint); if (previous) return previous;
     await refreshSource();
@@ -313,7 +313,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
       if (!config().enabled || execution.active().some(e => e.positionId === p.id)) continue;
       const bps = value.stale ? null : value.net / storedNotional(p.longFill) * 10000;
       const reason = clock() - p.openedAt >= p.maxHoldMinutes * 60000 ? '达到最长持有时间' : bps !== null && bps >= p.takeProfitBps ? '达到止盈' : bps !== null && bps <= -p.stopLossBps ? '达到止损' : '';
-      if (reason) { try { const attempt = store.db.prepare("SELECT count(*) AS n FROM executions WHERE position_id=? AND state='cancelled' AND json_extract(json,'$.kind')='close'").get(p.id).n; await closePosition(p.id, `auto-close:${p.id}:${attempt}`, reason); } catch (error) { recordFailure(`${p.base} 自动平仓未完成：${safeMessage(error)}`); } }
+      if (reason) { try { const attempt = store.prepare("SELECT count(*) AS n FROM executions WHERE position_id=? AND state='cancelled' AND json_extract(json,'$.kind')='close'").get(p.id).n; await closePosition(p.id, `auto-close:${p.id}:${attempt}`, reason); } catch (error) { recordFailure(`${p.base} 自动平仓未完成：${safeMessage(error)}`); } }
     }
     if (config().enabled && !config().entryPaused) {
       const active = store.positions('open');
@@ -333,7 +333,7 @@ export function createEngine(store, { catalogReader = loadCatalog, feedReader = 
     if (closing || !config().fundingEnabled) return Promise.resolve();
     if (accountingFlight) return accountingFlight;
     // Public accounting has its own lane and cannot delay risk exits or source polling.
-    const pending = store.db.prepare("SELECT json FROM positions WHERE json_extract(json,'$.accountingVersion')>=3 AND (status='open' OR coalesce(json_extract(json,'$.funding.status'),'unknown')!='complete') ORDER BY coalesce(json_extract(json,'$.fundingCheckedAt'),0) ASC LIMIT 10").all().map(row => JSON.parse(row.json))
+    const pending = store.prepare("SELECT json FROM positions WHERE json_extract(json,'$.accountingVersion')>=3 AND (status='open' OR coalesce(json_extract(json,'$.funding.status'),'unknown')!='complete') ORDER BY coalesce(json_extract(json,'$.fundingCheckedAt'),0) ASC LIMIT 10").all().map(row => JSON.parse(row.json))
       .filter(p => clock() - Math.max(p.fundingCheckedAt ?? 0, fundingAttempts.get(p.id) ?? 0) >= 60000).slice(0, 1);
     accountingFlight = Promise.all(pending.map(async original => {
       fundingAttempts.set(original.id, clock());

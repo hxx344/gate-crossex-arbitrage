@@ -16,7 +16,7 @@ function compact(rows, keys, limit = 600) {
 }
 export function analyticsView(store, config) {
   const samples = store.samples('equity');
-  const positions = store.db.prepare("SELECT id,json_extract(json,'$.base') AS base,json_extract(json,'$.entryGrossBps') AS entry FROM positions ORDER BY opened_at DESC LIMIT 50").all().map(p => {
+  const positions = store.prepare("SELECT id,json_extract(json,'$.base') AS base,json_extract(json,'$.entryGrossBps') AS entry FROM positions ORDER BY opened_at DESC LIMIT 50").all().map(p => {
     const rows = store.samples(p.id), spreads = rows.map(x => x.spreadBps).filter(Number.isFinite);
     const maxExitSpreadBps = spreads.length ? Math.max(...spreads) : null;
     return { positionId: p.id, base: p.base, maxExitSpreadBps, maxAdverseSpreadBps: maxExitSpreadBps !== null && Number.isFinite(p.entry) ? Math.max(0, maxExitSpreadBps - p.entry) : null, samples: compact(rows, ['spreadBps', 'net']) };
@@ -41,6 +41,6 @@ export function sampleAnalytics(store, positions, totals, now) {
     if (equity !== null) { store.set('equityPeak', peak); store.set('maxDrawdown', Math.max(store.get('maxDrawdown', 0) ?? 0, drawdown)); }
     for (const p of positions) store.sample(p.id, now, { at: now, sourceAt: p.valuation.at, spreadBps: p.valuation.stale ? null : p.valuation.spreadBps ?? null, net: p.valuation.stale ? null : p.valuation.netWithFunding ?? null });
     store.set('sampleAt', now);
-    store.db.prepare('DELETE FROM samples WHERE at<?').run(now - 90 * 86400000);
+    store.prepare('DELETE FROM samples WHERE at<?').run(now - 90 * 86400000);
   });
 }

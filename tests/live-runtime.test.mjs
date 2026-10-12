@@ -121,14 +121,15 @@ test('one display snapshot reuses its order read across a large execution histor
       }
     }
   });
-  const prepare = db.prepare.bind(db); let orderReads = 0;
-  db.prepare = sql => { if (sql === 'SELECT json FROM live_orders ORDER BY updated_at DESC') orderReads++; return prepare(sql); };
+  const statement = f.store.prepare('SELECT json FROM live_orders ORDER BY updated_at DESC');
+  const all = statement.all.bind(statement); let orderReads = 0;
+  statement.all = (...args) => { orderReads++; return all(...args); };
   try {
     const state = f.runtime.view();
     assert.equal(state.live.executions.length, 100);
     assert.ok(state.live.executions.every(e => e.state === 'completed' && e.legs.length === 2 && e.legs[0].index === 0));
     assert.equal(orderReads, 1, 'each HTTP snapshot must not reread every order for every execution');
-  } finally { db.prepare = prepare; }
+  } finally { statement.all = all; }
 });
 
 test('double confirmation is idempotent and each complete fill precedes the next leg', async t => {

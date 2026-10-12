@@ -34,16 +34,16 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     CREATE TABLE IF NOT EXISTS live_supplemental (version INTEGER PRIMARY KEY, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS live_trades (version INTEGER NOT NULL, transaction_id TEXT NOT NULL, created_at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(version,transaction_id));
     CREATE TABLE IF NOT EXISTS live_account_book (version INTEGER NOT NULL, id TEXT NOT NULL, created_at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(version,id));`);
-  const readSingleton = table => { const row = db.prepare(`SELECT json FROM ${table} WHERE singleton=1`).get(); return row ? JSON.parse(row.json) : null; };
-  const putSingleton = (table, value) => db.prepare(`INSERT INTO ${table} VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET json=excluded.json`).run(JSON.stringify(value));
+  const readSingleton = table => { const row = store.prepare(`SELECT json FROM ${table} WHERE singleton=1`).get(); return row ? JSON.parse(row.json) : null; };
+  const putSingleton = (table, value) => store.prepare(`INSERT INTO ${table} VALUES (1,?) ON CONFLICT(singleton) DO UPDATE SET json=excluded.json`).run(JSON.stringify(value));
   const connectionRecord = () => readSingleton('live_connection');
   const cacheRecord = () => readSingleton('live_cache') || { account: null, positions: [], openOrders: [], asOf: null, error: null };
-  const supplementalRecord = version => { const row = db.prepare('SELECT json FROM live_supplemental WHERE version=?').get(version || 0); return row ? JSON.parse(row.json) : {}; };
-  const historyRows = (table, version) => db.prepare(`SELECT json FROM ${table} WHERE version=? ORDER BY created_at DESC LIMIT 200`).all(version || 0).map(r => JSON.parse(r.json));
-  const orderRecords = () => db.prepare('SELECT json FROM live_orders ORDER BY updated_at DESC').all().map(r => JSON.parse(r.json));
-  const executionRecords = () => db.prepare('SELECT json FROM live_executions ORDER BY updated_at DESC LIMIT 100').all().map(r => JSON.parse(r.json));
-  const findOrder = orderId => { const row = db.prepare('SELECT json FROM live_orders WHERE id=? OR text=?').get(orderId, orderId); return row ? JSON.parse(row.json) : orderRecords().find(o => o.orderId === orderId); };
-  const getExecution = executionId => { const row = db.prepare('SELECT json FROM live_executions WHERE id=?').get(executionId); return row ? executionView(JSON.parse(row.json)) : null; };
+  const supplementalRecord = version => { const row = store.prepare('SELECT json FROM live_supplemental WHERE version=?').get(version || 0); return row ? JSON.parse(row.json) : {}; };
+  const historyRows = (table, version) => store.prepare(`SELECT json FROM ${table} WHERE version=? ORDER BY created_at DESC LIMIT 200`).all(version || 0).map(r => JSON.parse(r.json));
+  const orderRecords = () => store.prepare('SELECT json FROM live_orders ORDER BY updated_at DESC').all().map(r => JSON.parse(r.json));
+  const executionRecords = () => store.prepare('SELECT json FROM live_executions ORDER BY updated_at DESC LIMIT 100').all().map(r => JSON.parse(r.json));
+  const findOrder = orderId => { const row = store.prepare('SELECT json FROM live_orders WHERE id=? OR text=?').get(orderId, orderId); return row ? JSON.parse(row.json) : orderRecords().find(o => o.orderId === orderId); };
+  const getExecution = executionId => { const row = store.prepare('SELECT json FROM live_executions WHERE id=?').get(executionId); return row ? executionView(JSON.parse(row.json)) : null; };
   let stopped = false, lostOwnership = false, queue = Promise.resolve(), clientVersion = null, privateClient = null, supplementalFlight = null, supplementalAttempt = -Infinity;
   function exclusive(fn) {
     const result = queue.then(() => { if (stopped) fail('实盘服务正在停止', 503); return fn(); });
@@ -51,15 +51,15 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function takeOwnership() {
     return store.transaction(() => {
-      const row = db.prepare('SELECT owner,expires_at FROM live_owner WHERE singleton=1').get();
+      const row = store.prepare('SELECT owner,expires_at FROM live_owner WHERE singleton=1').get();
       if (row && row.owner !== owner && row.expires_at > clock()) return false;
-      db.prepare('INSERT INTO live_owner VALUES (1,?,?) ON CONFLICT(singleton) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at').run(owner, clock() + ownerLeaseMs);
+      store.prepare('INSERT INTO live_owner VALUES (1,?,?) ON CONFLICT(singleton) DO UPDATE SET owner=excluded.owner,expires_at=excluded.expires_at').run(owner, clock() + ownerLeaseMs);
       return true;
     });
   }
   const owns = () => {
     if (stopped || lostOwnership) return false;
-    const row = db.prepare('SELECT owner,expires_at FROM live_owner WHERE singleton=1').get();
+    const row = store.prepare('SELECT owner,expires_at FROM live_owner WHERE singleton=1').get();
     if (row?.owner !== owner || row.expires_at <= clock()) { lostOwnership = true; return false; }
     return true;
   };
@@ -69,7 +69,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   function writeOrder(order) {
     if (!owns()) fail('实盘执行锁已失效，订单仅允许查询确认');
     order.updatedAt = clock();
-    db.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at,json=excluded.json')
+    store.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at,json=excluded.json')
       .run(order.id, order.executionId, order.text, order.version, order.status, order.updatedAt, JSON.stringify(order));
   }
   function executionView(execution, executionOrders) {
@@ -87,7 +87,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     }
   }
   if (takeOwnership()) recoverUnsent(); else lostOwnership = true;
-  const heartbeat = setInterval(() => { if (!stopped && owns()) db.prepare('UPDATE live_owner SET expires_at=? WHERE singleton=1 AND owner=?').run(clock() + ownerLeaseMs, owner); }, Math.max(1000, Math.floor(ownerLeaseMs / 3)));
+  const heartbeat = setInterval(() => { if (!stopped && owns()) store.prepare('UPDATE live_owner SET expires_at=? WHERE singleton=1 AND owner=?').run(clock() + ownerLeaseMs, owner); }, Math.max(1000, Math.floor(ownerLeaseMs / 3)));
   heartbeat.unref();
   function getClient(record = connectionRecord()) {
     if (!record?.enabled) fail('请先连接 Gate CrossEx 账户');
@@ -201,7 +201,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   }
   function saveSupplemental(version, values) {
     const next = { ...supplementalRecord(version), ...values };
-    db.prepare('INSERT INTO live_supplemental VALUES (?,?) ON CONFLICT(version) DO UPDATE SET json=excluded.json').run(version, JSON.stringify(next));
+    store.prepare('INSERT INTO live_supplemental VALUES (?,?) ON CONFLICT(version) DO UPDATE SET json=excluded.json').run(version, JSON.stringify(next));
   }
   function refreshSupplemental(force = false) {
     if (supplementalFlight) return supplementalFlight;
@@ -226,19 +226,19 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
         store.transaction(() => {
           if (name === 'recentTrades') for (const trade of values) {
             if (!trade.transaction_id || !trade.order_id || typeof trade.symbol !== 'string' || !['BUY', 'SELL'].includes(trade.side) || !positive(trade.qty) || !positive(trade.price)) throw new Error('INVALID_TRADE');
-            const previousRow = db.prepare('SELECT json FROM live_trades WHERE version=? AND transaction_id=?').get(record.version, trade.transaction_id);
+            const previousRow = store.prepare('SELECT json FROM live_trades WHERE version=? AND transaction_id=?').get(record.version, trade.transaction_id);
             let completeTrade = trade;
             if (previousRow) {
               const known = JSON.parse(previousRow.json);
               if (['order_id', 'symbol', 'side'].some(k => known[k] !== trade[k]) || !D(known.qty).eq(trade.qty) || !D(known.price).eq(trade.price)) throw new Error('CONFLICTING_TRADE');
               completeTrade = { ...known, ...Object.fromEntries(Object.entries(trade).filter(([, value]) => value !== null && value !== undefined)) };
             }
-            db.prepare('INSERT INTO live_trades VALUES (?,?,?,?) ON CONFLICT(version,transaction_id) DO UPDATE SET json=excluded.json')
+            store.prepare('INSERT INTO live_trades VALUES (?,?,?,?) ON CONFLICT(version,transaction_id) DO UPDATE SET json=excluded.json')
               .run(record.version, String(trade.transaction_id), Number(trade.create_time) || 0, JSON.stringify(completeTrade));
           }
           if (name === 'accountBook') for (const entry of values) {
             if (!entry.id) throw new Error('INVALID_ACCOUNT_ENTRY');
-            db.prepare('INSERT INTO live_account_book VALUES (?,?,?,?) ON CONFLICT(version,id) DO UPDATE SET json=excluded.json')
+            store.prepare('INSERT INTO live_account_book VALUES (?,?,?,?) ON CONFLICT(version,id) DO UPDATE SET json=excluded.json')
               .run(record.version, String(entry.id), Number(entry.create_time) || 0, JSON.stringify(entry));
           }
           saveSupplemental(record.version, { ...(name === 'fees' || name === 'adl' ? { [name]: values } : {}), [`${name}AsOf`]: startedAt, [`${name}Error`]: null });
@@ -443,11 +443,11 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
         ...(selected.some(p => p.directionSource === 'quantity_sign') ? ['单向净仓方向按持仓数量符号推导；所有平仓单仅减仓，不跨过零仓位'] : []),
         ...(input.kind === 'open' && plan.legs.length === 2 ? ['两腿依次提交；第一腿未在本次确认中全成则不发送第二腿，可能留下单边敞口，需手动处理'] : []),
         ...(input.kind === 'close' && plan.legs.length > 1 ? ['所选持仓分别提交一次减仓单；其中一腿未成交时，其他腿仍按本次确认提交，不自动补单'] : [])] };
-    db.prepare('INSERT INTO live_previews(id,expires_at,json) VALUES (?,?,?)').run(preview.id, preview.expiresAt, JSON.stringify(preview));
+    store.prepare('INSERT INTO live_previews(id,expires_at,json) VALUES (?,?,?)').run(preview.id, preview.expiresAt, JSON.stringify(preview));
     return copy(preview);
   }
   function savedRequest(requestId, fingerprint) {
-    const row = db.prepare('SELECT * FROM live_requests WHERE id=?').get(requestId);
+    const row = store.prepare('SELECT * FROM live_requests WHERE id=?').get(requestId);
     if (!row) return null;
     if (row.fingerprint !== fingerprint) fail('同一请求标识不能用于不同操作');
     const result = JSON.parse(row.result); return row.kind === 'confirm' ? getExecution(result.executionId) : { ...result, order: findOrder(result.orderId) };
@@ -457,7 +457,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const requestId = requestKey(input?.requestId), fingerprint = hash(['confirm', input?.previewId]);
     const previous = savedRequest(requestId, fingerprint); if (previous) return previous;
     const deadline = performance.now() + confirmationWaitMs;
-    const row = db.prepare('SELECT * FROM live_previews WHERE id=?').get(String(input?.previewId || ''));
+    const row = store.prepare('SELECT * FROM live_previews WHERE id=?').get(String(input?.previewId || ''));
     if (!row || row.consumed) fail('预览不存在或已确认，请重新预览');
     const plan = JSON.parse(row.json);
     if (clock() >= plan.expiresAt) fail('预览已过期，请重新预览');
@@ -479,10 +479,10 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       symbol: leg.symbol, exchange: leg.exchange, side: leg.side, positionSide: leg.positionSide, quantity: D(leg.quantity).toString(), price: D(leg.price).toString(),
       reduceOnly: plan.kind === 'close', orderType: leg.orderType || 'LIMIT', timeInForce: leg.timeInForce || 'IOC', executedQty: '0', orderId: null, createdAt: clock(), updatedAt: clock(), error: null }));
     store.transaction(() => {
-      db.prepare('UPDATE live_previews SET consumed=1 WHERE id=?').run(plan.id);
-      db.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(execution.id, plan.id, clock(), JSON.stringify(execution));
+      store.prepare('UPDATE live_previews SET consumed=1 WHERE id=?').run(plan.id);
+      store.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(execution.id, plan.id, clock(), JSON.stringify(execution));
       for (const leg of legs) writeOrder(leg);
-      db.prepare('INSERT INTO live_requests VALUES (?,?,?,?)').run(requestId, fingerprint, 'confirm', JSON.stringify({ executionId: execution.id }));
+      store.prepare('INSERT INTO live_requests VALUES (?,?,?,?)').run(requestId, fingerprint, 'confirm', JSON.stringify({ executionId: execution.id }));
     });
     const client = getClient(record);
     const confirmationStarted = performance.now();
@@ -547,7 +547,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (order.version !== record.version || !order.orderId || !ACTIVE.has(order.status)) fail('订单状态尚未确认、已结束或撤单处理中，不能重复撤单');
     order.status = 'CANCEL_PENDING'; order.error = '撤单请求待交易所确认';
     const result = { requestId, orderId: order.id, status: 'CANCEL_PENDING' };
-    store.transaction(() => { writeOrder(order); db.prepare('INSERT INTO live_requests VALUES (?,?,?,?)').run(requestId, fingerprint, 'cancel', JSON.stringify(result)); });
+    store.transaction(() => { writeOrder(order); store.prepare('INSERT INTO live_requests VALUES (?,?,?,?)').run(requestId, fingerprint, 'cancel', JSON.stringify(result)); });
     try {
       const response = await bounded(getClient(record).cancelOrder(order.orderId));
       if (owns() && object(response) && response.state) applyResult(order, response);
@@ -633,14 +633,14 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return exclusive(async () => {
       try { return await action(input); }
       catch (error) {
-        const saved = typeof input?.requestId === 'string' && db.prepare('SELECT id FROM live_requests WHERE id=?').get(input.requestId);
+        const saved = typeof input?.requestId === 'string' && store.prepare('SELECT id FROM live_requests WHERE id=?').get(input.requestId);
         if (!saved && error && typeof error === 'object') error.requestStatus = 'not_submitted';
         throw error;
       }
     });
   }
   function requestStatusInternal(input) {
-    const requestId = requestKey(input), row = db.prepare('SELECT kind,fingerprint FROM live_requests WHERE id=?').get(requestId);
+    const requestId = requestKey(input), row = store.prepare('SELECT kind,fingerprint FROM live_requests WHERE id=?').get(requestId);
     if (row) return { requestId, requestStatus: 'submitted', kind: row.kind, result: savedRequest(requestId, row.fingerprint) };
     // Only the sole executing process can prove its preceding queue contains no
     // preflight request which has not reached the durable intent transaction.
@@ -650,5 +650,5 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   return { connection: input => exclusive(() => connectInternal(input)), disconnect: () => exclusive(disconnectInternal),
     refresh: options => exclusive(() => refreshInternal(options)), preview: input => exclusive(() => previewInternal(input)), confirm: input => manualAction(input, confirmInternal),
     cancel: input => manualAction(input, cancelInternal), requestStatus: requestId => exclusive(() => requestStatusInternal(requestId)), refreshDetails: () => refreshSupplemental(true), view, connectionView, summary,
-    async stop() { clearInterval(heartbeat); await queue; stopped = true; await supplementalFlight; db.prepare('DELETE FROM live_owner WHERE singleton=1 AND owner=?').run(owner); } };
+    async stop() { clearInterval(heartbeat); await queue; stopped = true; await supplementalFlight; store.prepare('DELETE FROM live_owner WHERE singleton=1 AND owner=?').run(owner); } };
 }
