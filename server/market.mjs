@@ -333,6 +333,32 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     // no native symbol, identityVerified flag or quantity conversion factor.
     return { quote: { exchange: exchange.toLowerCase(), base, quoteCurrency: currency, settlementCurrency: currency, crossexSymbol: symbol }, rule };
   }
+  // A quantity-independent, inert view of the same identity/price rules used by
+  // manual previews. No preview is constructed and no private client is used.
+  async function openCapacityContext(request) {
+    const c = config(), marketRevision = revision();
+    const resolved = await Promise.all(request.requests.map(r => resolveSymbol(r.symbol)));
+    if (request.source === 'pair' && !validManualPair(resolved[0].quote, resolved[1].quote)) throw new AppError('双腿须为身份可比、同一基础币的不同交易所加密合约');
+    const { books, fx } = await booksAndFx(resolved.map(r => r.quote), true, manualDepthReader);
+    if (marketRevision !== revision()) throw new AppError('设置已变化，请重新读取开仓容量', 409);
+    const notes = [...new Set(resolved.flatMap(r => r.rule.unverifiedConstraints))];
+    let expiresAt = Math.min(catalog.at + 900000, ...books.map(b => b.at + 10000)), sourceAt = Math.min(...books.map(b => b.at));
+    const legs = request.requests.map((r, i) => {
+      const { quote, rule } = resolved[i], built = buildLeg(quote, r.side, r.side === 'BUY' ? 'LONG' : 'SHORT', rule, books[i]);
+      const price = r.price ?? built.price;
+      checkPrice(price, rule);
+      const rate = fxRate(settlement(quote), fx, clock());
+      if (settlement(quote) !== 'USDT') { expiresAt = Math.min(expiresAt, rate.at + Math.min(180000, fx.staleAfterMs)); sourceAt = Math.min(sourceAt, rate.at); }
+      const immediate = r.orderType === 'MARKET' || ['IOC', 'FOK'].includes(r.timeInForce);
+      const depthQuantity = immediate ? (r.side === 'BUY' ? books[i].asks : books[i].bids)
+        .filter(([p]) => r.side === 'BUY' ? D(p).lte(price) : D(p).gte(price)).reduce((sum, [, q]) => sum.plus(q), D(0)).toString() : null;
+      if (request.source === 'direct' && r.orderType === 'LIMIT' && r.price === undefined) notes.push('限价尚未填写，暂按当前盘口保护价估算');
+      return { symbol: rule.symbol, side: r.side, quoteCurrency: quote.quoteCurrency, orderType: r.orderType, timeInForce: r.timeInForce,
+        price, budgetPrice: Decimal.max(price, built.referencePrice).toString(), fxRate: String(rate.ask), depthQuantity, rule };
+    });
+    if (legs.some(l => l.orderType === 'MARKET')) notes.push('市价单按当前保护价内深度估算；实际成交价格由提交时盘口决定');
+    return { base: resolved[0].quote.base, legs, config: c, marketRevision, sourceAt, expiresAt, notes };
+  }
   async function manualPlan(requests, source) {
     const c = config(), marketRevision = revision();
     if (c.entryPaused) throw new AppError('新开仓已暂停，平仓仍可使用');
@@ -426,17 +452,20 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     if (revision() !== plan.marketRevision) throw new AppError('设置已变化，请重新预览', 409);
     return true;
   }
-  async function positionsNotional(positions) {
+  async function positionsValuation(positions) {
     const active = positions.filter(p => !D(p.position_qty).isZero());
     const fx = active.some(p => !p.symbol.endsWith('_USDT')) ? await fxReader() : null;
-    let total = D(0);
+    let total = D(0), expiresAt = Infinity;
     for (const p of active) {
       const match = /^(BINANCE|BYBIT|OKX|GATE|KRAKEN|HYPERLIQUID|DERIBIT|LIGHTER)_FUTURE_[A-Z0-9]{1,30}_(USDT|USDC|USD)$/.exec(p.symbol);
       if (!match || !positiveDecimal(p.mark_price)) throw new AppError('已有持仓的名义金额无法核实，暂不能新开仓');
-      total = total.plus(D(p.position_qty).abs().times(p.mark_price).times(fxRate(match[2], fx, clock()).ask));
+      const rate = fxRate(match[2], fx, clock());
+      if (match[2] !== 'USDT') expiresAt = Math.min(expiresAt, rate.at + Math.min(180000, fx.staleAfterMs));
+      total = total.plus(D(p.position_qty).abs().times(p.mark_price).times(rate.ask));
     }
-    return total.toString();
+    return { notionalUSDT: total.toString(), expiresAt };
   }
+  async function positionsNotional(positions) { return (await positionsValuation(positions)).notionalUSDT; }
   function settings(input) {
     if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).some(k => !['config', 'monitorPassword', 'clearMonitorPassword'].includes(k))) throw new AppError('设置格式无效');
     if (!input.config || typeof input.config !== 'object' || Array.isArray(input.config) || Object.keys(input.config).some(k => !CONFIG_KEYS.includes(k))) throw new AppError('实盘仅支持手动交易；设置字段无效');
@@ -458,6 +487,6 @@ export function createMarket(store, { catalogReader = loadCatalog, feedReader = 
     }
     return view({ includeOpportunities: false });
   }
-  return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, resolveDisplaySymbol, previewDirect, previewPair, previewOpen, revalidateOpen, previewClose, revalidateClose, positionsNotional, settings,
+  return { view, config, revision, refresh, refreshSource, refreshCatalog, instruments, resolveSymbol, resolveDisplaySymbol, openCapacityContext, previewDirect, previewPair, previewOpen, revalidateOpen, previewClose, revalidateClose, positionsNotional, positionsValuation, settings,
     async stop() { stopping = true; await Promise.all([sourceFlight, catalogFlight]); } };
 }

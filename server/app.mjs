@@ -82,6 +82,7 @@ export function createApp({ dataDir = process.env.DATA_DIR || path.join(root, '.
       if (route === '/api/live/instruments' && req.method === 'GET') return json(res, 200, await market.instruments());
       if (route === '/api/live/market' && req.method === 'GET') return json(res, 200, await terminal.read(url.searchParams.get('symbol'), url.searchParams.get('interval') || '5m'));
       if (route === '/api/live/preview' && req.method === 'POST') return json(res, 200, await live.preview(await body(req)));
+      if (route === '/api/live/open-capacity' && req.method === 'POST') return json(res, 200, await live.openCapacity(await body(req)));
       if (route === '/api/live/confirm' && req.method === 'POST') return json(res, 200, await live.confirm(await body(req)));
       if (route === '/api/live/cancel' && req.method === 'POST') return json(res, 200, await live.cancel(await body(req)));
       if (route.startsWith('/api/live/requests/') && req.method === 'GET') return json(res, 200, await live.requestStatus(decodeURIComponent(route.slice('/api/live/requests/'.length))));

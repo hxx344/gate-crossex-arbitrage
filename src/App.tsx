@@ -210,6 +210,9 @@ export default function App() {
   const accountStale = !online || !live || live.stale || live.partial || !live.asOf || now - live.asOf > 15_000 || live.asOf > now + 1000;
   const tradingDisabled = busy || !live?.tradingAllowed || accountStale || !!pendingRequest;
   const openingDisabled = tradingDisabled || !!state?.config.entryPaused;
+  const capacityContext = live && state ? { live: { ...live, stale: accountStale }, active: hub.readActive, background: hub.background,
+    csrfToken: connectionInfo?.csrfToken || state.csrfToken, now, readNow: serverClock.current.now,
+    revision: JSON.stringify([state.config, !!pendingRequest, live.orders.map(o => [o.id, o.status, o.filledQuantity]), live.positions.map(p => [p.id, p.quantity])]) } : null;
   const extraAlerts = live?.alerts.map(item => typeof item === 'string' ? item : item.message || item.reason).filter((item): item is string => !!item && !live.reasons.includes(item) && item !== live.connection.error) || [];
 
   return <div className="app"><header className="topbar"><a className="brand" href="#positions" onClick={() => go('positions')}><span className="brand-icon"><ArrowLeftRight size={21}/></span><span>Gate <strong>CrossEx</strong></span><span className="tag live-tag">LIVE</span></a>
@@ -226,8 +229,8 @@ export default function App() {
       {extraAlerts.length > 0 && <div className="notice warning" role="status"><AlertCircle size={15}/><span>{extraAlerts.join(' ')}</span></div>}
       {state.config.entryPaused && (tab === 'trade' || tab === 'hedge') && <p className="inline-state warning">新开仓已暂停，可在设置中恢复；仍可手动平仓和撤单。</p>}
       {tab === 'positions' && <><div className="view-heading portfolio-heading"><div><span className="eyebrow">PORTFOLIO</span><h2>投资组合</h2><p>统一保证金概览与跨交易所真实持仓</p></div><div className="portfolio-count"><strong>{new Set(live.positions.map(p => p.baseCurrency || p.symbol)).size}</strong><span>个币种 <b>·</b> {live.positions.length} 条持仓腿</span></div></div><AccountOverview live={live}/><PortfolioPanel live={live} instruments={instruments.items} disabled={tradingDisabled} close={positions => previewOrder({ kind: 'close', positions })}/></>}
-      {tab === 'trade' && <TradingTerminal instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} preview={previewOrder}/>}
-      {tab === 'hedge' && <ManualHedgePanel key={[search, pair.longExchange, pair.shortExchange].join(':')} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} opportunities={state.opportunities} now={now} initial={{ base: search, ...pair }} monitorStale={marketStale} preview={previewOrder}/>}
+      {tab === 'trade' && <TradingTerminal instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} preview={previewOrder} capacityContext={capacityContext!}/>}
+      {tab === 'hedge' && <ManualHedgePanel key={[search, pair.longExchange, pair.shortExchange].join(':')} instruments={instruments.items} catalogError={instruments.error} live={live} budget={state.config.notionalPerLeg} active={hub.readActive} background={hub.background} disabled={openingDisabled} opportunities={state.opportunities} now={now} initial={{ base: search, ...pair }} monitorStale={marketStale} preview={previewOrder} capacityContext={capacityContext!}/>}
       {tab === 'orders' && <><div className="view-heading"><div><span className="eyebrow">ORDERS & EXECUTIONS</span><h2>订单与操作记录</h2><p>核对真实成交状态，管理尚未成交的委托</p></div></div><HistoryPanel live={live} disabled={tradingDisabled} querying={busy} query={() => void queryAccount()} cancel={setCancelOrder}/></>}
 
     </>}

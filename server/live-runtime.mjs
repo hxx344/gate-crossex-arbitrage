@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { AppError } from './model.mjs';
 import { D } from './money.mjs';
 import { createGateClient, GATE_EXCHANGES } from './live-client.mjs';
+import { capacityRequest, capacityResult, calculateCapacity } from './open-capacity.mjs';
 
 const TERMINAL = new Set(['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT']);
 const ACTIVE = new Set(['NEW', 'OPEN', 'PARTIALLY_FILLED']);
@@ -21,7 +22,7 @@ const credentialError = () => new AppError('账户验证未完成，请核对 AP
 /** Private reads are automatic. Every exchange write requires a fresh manual API action. */
 export function createLiveRuntime(store, { market, clientFactory = createGateClient, clock = Date.now,
   freshnessMs = 15000, requestTimeoutMs = 12000, ownerLeaseMs = 60000, confirmationPollMs = 15000, pollIntervalMs = 250,
-  confirmationWaitMs = 20000, postConfirmRefreshMs = 2000 } = {}) {
+  confirmationWaitMs = 20000, postConfirmRefreshMs = 2000, capacityTimeoutMs = 4000, capacityRiskTtlMs = 5000 } = {}) {
   if (!market) throw new Error('Live runtime requires a market reader');
   const db = store.db, owner = id();
   db.exec(`CREATE TABLE IF NOT EXISTS live_connection (singleton INTEGER PRIMARY KEY CHECK(singleton=1), json TEXT NOT NULL);
@@ -45,6 +46,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   const findOrder = orderId => { const row = store.prepare('SELECT json FROM live_orders WHERE id=? OR text=?').get(orderId, orderId); return row ? JSON.parse(row.json) : orderRecords().find(o => o.orderId === orderId); };
   const getExecution = executionId => { const row = store.prepare('SELECT json FROM live_executions WHERE id=?').get(executionId); return row ? executionView(JSON.parse(row.json)) : null; };
   let stopped = false, lostOwnership = false, queue = Promise.resolve(), clientVersion = null, privateClient = null, supplementalFlight = null, supplementalAttempt = -Infinity;
+  const capacityReads = new Map(), capacityFlights = new Set();
   function exclusive(fn) {
     const result = queue.then(() => { if (stopped) fail('实盘服务正在停止', 503); return fn(); });
     queue = result.catch(() => {}); return result;
@@ -307,10 +309,16 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (record) putSingleton('live_connection', { ...record, enabled: false, apiKey: null, apiSecret: null, version: record.version + 1 });
     privateClient = null; clientVersion = null; return connectionView();
   }
-  async function validateLimits(plan, cache) {
-    if (plan.kind !== 'open') return;
+  function checkPositionLimit(plan, cache) {
     const held = cache.positions.filter(p => !D(p.position_qty).isZero());
     if (Number.isFinite(plan.limits?.maxOpen) && held.length + plan.legs.length > plan.limits.maxOpen * 2) fail('实际持仓数量已达到上限');
+  }
+  function checkCooldown(plan) {
+    const cooldown = Number(plan.limits?.cooldownSeconds || 0) * 1000;
+    if (cooldown > 0 && executionRecords().some(e => e.base === plan.base && clock() - e.createdAt < cooldown)) fail('此资产仍在手动交易冷却期');
+  }
+  async function positionsNotional(cache) {
+    const held = cache.positions.filter(p => !D(p.position_qty).isZero());
     let total = market.positionsNotional ? D(await market.positionsNotional(held)) : D(0);
     const fx = market.view({ includeOpportunities: false }).fx || [];
     for (const p of market.positionsNotional ? [] : held) {
@@ -320,10 +328,15 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       if (!positive(rate)) fail('现有持仓汇率不可用，无法验证总名义额上限');
       total = total.plus(D(p.position_qty).abs().times(price).times(rate));
     }
+    return total;
+  }
+  async function validateLimits(plan, cache) {
+    if (plan.kind !== 'open') return;
+    checkPositionLimit(plan, cache);
+    let total = await positionsNotional(cache);
     for (const leg of plan.legs) { if (!positive(leg.notionalUSDT)) fail('订单名义额无效'); total = total.plus(leg.notionalUSDT); }
     if (!positive(plan.limits?.maxTotalNotional) || total.gt(plan.limits.maxTotalNotional)) fail('订单超过账户总名义额上限');
-    const cooldown = Number(plan.limits?.cooldownSeconds || 0) * 1000;
-    if (cooldown > 0 && executionRecords().some(e => e.base === plan.base && clock() - e.createdAt < cooldown)) fail('此资产仍在手动交易冷却期');
+    checkCooldown(plan);
   }
   function checkConflicts(plan, cache) {
     if (activeOrders().some(o => ['UNKNOWN', 'INVALID', 'SENDING', 'CANCEL_PENDING'].includes(o.status)) || cache.openOrders.some(o => !REMOTE.has(o.state))) fail('存在未知或待确认订单，暂停新的交易');
@@ -336,6 +349,86 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (['LONG', 'SHORT'].includes(p.position_side)) return p.position_side;
     if (mode === 'SINGLE' && p.position_side === 'NONE' && numeric(p.position_qty) && !D(p.position_qty).isZero()) return D(p.position_qty).gt(0) ? 'LONG' : 'SHORT';
     return null;
+  }
+  // Capacity reads do not enter the execution queue. Capture balances as well as
+  // positions/orders: the preview fingerprint deliberately excludes balances.
+  const capacitySignature = () => hash([connectionRecord(), cacheRecord(), configFingerprint(),
+    activeOrders().map(o => [o.id, o.version, o.status, o.executedQty]), executionRecords().map(e => [e.id, e.createdAt])]);
+  function capacityRead(key, read) {
+    const now = clock();
+    for (const [k, entry] of capacityReads) if (!entry.pending && entry.expiresAt <= now + Math.min(1000, capacityRiskTtlMs / 5)) capacityReads.delete(k);
+    let entry = capacityReads.get(key);
+    if (!entry) {
+      if (capacityReads.size >= 64 || [...capacityReads.values()].filter(value => value.pending).length >= 8) return Promise.reject(new Error('CAPACITY_READ_BUSY'));
+      entry = { pending: true, asOf: now, expiresAt: now + capacityRiskTtlMs };
+      // Retain even timed-out in-flight reads until they settle, preventing a
+      // slow provider from multiplying concurrent private requests on retries.
+      entry.promise = Promise.resolve().then(read).then(value => ({ value, asOf: entry.asOf, expiresAt: entry.expiresAt }), error => {
+        entry.expiresAt = clock() + 1000; throw error;
+      }).finally(() => { entry.pending = false; });
+      capacityReads.set(key, entry);
+    }
+    return bounded(entry.promise, Math.min(requestTimeoutMs, capacityTimeoutMs));
+  }
+  async function openCapacityInternal(request) {
+    let record, cache;
+    try { ({ record, cache } = freshCache()); }
+    catch { return capacityResult(request, clock(), connectionRecord()?.version || 0, 'unavailable', '账户或订单数据未完整同步，请刷新后再查看容量'); }
+    const stamp = capacitySignature(), config = market.config ? market.config() : market.view({ includeOpportunities: false }).config;
+    const plan = { kind: 'open', base: request.requests[0].symbol.split('_')[2], legs: request.requests, limits: config };
+    try {
+      if (config.entryPaused) fail('新开仓已暂停，平仓仍可使用');
+      if (!owns()) fail('本实例未持有执行锁，暂不能新开仓');
+      if (record.tradePermission === 'denied') fail('此凭据没有交易权限');
+      checkConflicts(plan, cache); checkPositionLimit(plan, cache); checkCooldown(plan);
+    } catch (error) {
+      return { ...capacityResult(request, clock(), record.version, 'blocked', error.message), asOf: cache.asOf,
+        expiresAt: Math.min(clock() + capacityRiskTtlMs, cache.asOf + freshnessMs) };
+    }
+    let context;
+    try { context = await market.openCapacityContext(request); }
+    catch { return capacityResult(request, clock(), record.version, 'unavailable', '行情、合约规则或汇率未能核实，请稍后重试'); }
+    if (stopped) return capacityResult(request, clock(), record.version, 'unavailable', '实盘服务正在停止');
+    if (stamp !== capacitySignature()) return capacityResult(request, clock(), record.version, 'unavailable', '账户、持仓或设置已变化，请重新读取容量');
+    try {
+      const client = getClient(record), prefix = `${record.version}:${record.accountReference}:`, venues = [...new Set(context.legs.map(l => l.symbol.split('_')[0]))];
+      const [symbolReads, isolatedReads, heldValuation] = await Promise.all([
+        Promise.all(context.legs.map(leg => capacityRead(`${prefix}risk:${leg.symbol}`, async () => {
+          const [leverage, limits] = await Promise.all([client.getLeverages([leg.symbol]), client.getRiskLimits([leg.symbol])]);
+          if (!object(leverage) || !Array.isArray(limits) || limits.length !== 1 || limits[0]?.symbol !== leg.symbol) throw new Error('RISK_UNKNOWN');
+          return { symbol: leg.symbol, leverage: leverage[leg.symbol], tiers: limits[0].tiers };
+        }))),
+        cache.account.account_mode === 'ISOLATED_EXCHANGE' ? Promise.all(venues.map(venue => capacityRead(`${prefix}account:${venue}:${hash(cache)}`, async () => {
+          const account = await client.getAccount(venue), accountUid = verifyUid(validateAccount(account), record.accountUid);
+          if (account.account_mode !== 'ISOLATED_EXCHANGE' || account.exchange_type !== venue || account.position_mode !== cache.account.position_mode) throw new Error('ISOLATED_ACCOUNT_UNKNOWN');
+          return { venue, accountUid, availableMargin: account.available_margin };
+        }))) : [],
+        market.positionsValuation ? market.positionsValuation(cache.positions) : positionsNotional(cache).then(value => ({ notionalUSDT: value,
+          expiresAt: cache.positions.some(p => !D(p.position_qty).isZero() && !p.symbol.endsWith('_USDT')) ? clock() : cache.asOf + freshnessMs })),
+      ]);
+      if (stopped) return capacityResult(request, clock(), record.version, 'unavailable', '实盘服务正在停止');
+      // A UID-less initial connection may acquire identity evidence later. Keep
+      // that evidence on cached venue reads and compare every observed identity.
+      const observedUids = new Set([record.accountUid, cache.account?.user_id, ...cache.positions.map(p => p.user_id),
+        ...cache.openOrders.map(o => o.user_id), ...isolatedReads.map(r => r.value.accountUid)].map(remoteUid).filter(Boolean));
+      if (observedUids.size > 1) throw new Error('INCONSISTENT_CAPACITY_ACCOUNT');
+      const now = clock(), expiresAt = Math.min(cache.asOf + freshnessMs, heldValuation.expiresAt, ...symbolReads.map(r => r.expiresAt), ...isolatedReads.map(r => r.expiresAt));
+      if (stamp !== capacitySignature() || !owns()) return capacityResult(request, now, record.version, 'unavailable', '账户、持仓或设置已变化，请重新读取容量');
+      if (now >= expiresAt || now >= context.expiresAt) return capacityResult(request, now, record.version, 'unavailable', '容量依赖的账户、盘口或风险快照已过期');
+      const risk = symbolReads.map(row => {
+        const venue = row.value.symbol.split('_')[0], isolated = isolatedReads.find(r => r.value.venue === venue);
+        return { ...row.value, asOf: Math.min(row.asOf, isolated?.asOf ?? cache.asOf), marginGroup: isolated ? venue : 'CROSSEX',
+          availableMargin: isolated ? isolated.value.availableMargin : cache.account.available_margin };
+      });
+      return calculateCapacity(request, context, risk, { now, connectionVersion: record.version, positionsNotional: heldValuation.notionalUSDT, expiresAt });
+    } catch { return capacityResult(request, clock(), record.version, 'unavailable', '当前杠杆、风险档位、持仓估值或可用保证金未能核实'); }
+  }
+  function openCapacity(input) {
+    const request = capacityRequest(input), version = connectionRecord()?.version || 0;
+    if (stopped || capacityFlights.size >= 4) return Promise.resolve(capacityResult(request, clock(), version, 'unavailable', '容量读取繁忙，请稍后重试'));
+    const pending = openCapacityInternal(request).finally(() => capacityFlights.delete(pending));
+    capacityFlights.add(pending);
+    return bounded(pending, capacityTimeoutMs).catch(() => capacityResult(request, clock(), version, 'unavailable', '容量读取超时，请稍后重试'));
   }
   async function riskPreview(plan, record, cache) {
     if (plan.kind !== 'open') return null;
@@ -648,7 +741,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return { requestId, requestStatus: 'not_submitted' };
   }
   return { connection: input => exclusive(() => connectInternal(input)), disconnect: () => exclusive(disconnectInternal),
-    refresh: options => exclusive(() => refreshInternal(options)), preview: input => exclusive(() => previewInternal(input)), confirm: input => manualAction(input, confirmInternal),
+    refresh: options => exclusive(() => refreshInternal(options)), preview: input => exclusive(() => previewInternal(input)), openCapacity, confirm: input => manualAction(input, confirmInternal),
     cancel: input => manualAction(input, cancelInternal), requestStatus: requestId => exclusive(() => requestStatusInternal(requestId)), refreshDetails: () => refreshSupplemental(true), view, connectionView, summary,
     async stop() { clearInterval(heartbeat); await queue; stopped = true; await supplementalFlight; store.prepare('DELETE FROM live_owner WHERE singleton=1 AND owner=?').run(owner); } };
 }
